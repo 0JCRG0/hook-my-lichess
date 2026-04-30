@@ -45,6 +45,7 @@ from pathlib import Path
 
 from . import api, board as board_mod, overlay, render
 from .engine import PuzzleSession, MoveResult
+from .settings import Settings, load_settings
 
 
 CTRL_C = 0x03
@@ -91,11 +92,42 @@ class Layout:
         except OSError:
             pass
 
-    def overlay_anchor(self) -> tuple[int, int]:
-        """Return (row, col) where the image's top-left should sit (top-right corner)."""
-        cell_w, _ = overlay.image_cell_size()
-        col = max(1, self.cols - cell_w + 1)
-        return (1, col)
+    def effective_cells(self, spec: overlay.OverlaySpec) -> tuple[int, int]:
+        """Cells the image will actually occupy after clamping to the terminal."""
+        cw, ch = spec.cell_size()
+        return (max(1, min(cw, self.cols)), max(1, min(ch, self.rows)))
+
+    def overlay_anchor(
+        self,
+        spec: overlay.OverlaySpec,
+        position,
+    ) -> tuple[int, int]:
+        """Return (row, col) where the image's top-left should sit, given the
+        user's position preference (preset name or [row, col] tuple).
+
+        Uses the *clamped* cell size so the image is never anchored such
+        that it would overflow the terminal."""
+        cell_w, cell_h = self.effective_cells(spec)
+
+        if isinstance(position, (tuple, list)):
+            row, col = int(position[0]), int(position[1])
+            row = max(1, min(row, self.rows - cell_h + 1))
+            col = max(1, min(col, self.cols - cell_w + 1))
+            return (row, col)
+
+        if position == "top-left":
+            return (1, 1)
+        if position == "bottom-right":
+            return (max(1, self.rows - cell_h + 1),
+                    max(1, self.cols - cell_w + 1))
+        if position == "bottom-left":
+            return (max(1, self.rows - cell_h + 1), 1)
+        if position == "center":
+            row = max(1, (self.rows - cell_h) // 2 + 1)
+            col = max(1, (self.cols - cell_w) // 2 + 1)
+            return (row, col)
+        # default: top-right
+        return (1, max(1, self.cols - cell_w + 1))
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -124,6 +156,9 @@ class Wrapper:
         self.orig_attrs: list | None = None
         self.layout = Layout()
 
+        self.settings: Settings = load_settings()
+        self.spec: overlay.OverlaySpec = self._build_spec()
+
         self.overlay_supported = overlay.is_supported()
         self.image_transmitted: bool = False
         self.last_overlay_t: float = 0.0
@@ -133,6 +168,9 @@ class Wrapper:
         self.snoop_buffer: str = ""
         self.status_msg: str = ""
         self.banner: str = ""
+        self.claude_idle: bool = False
+        self.closing_at: float | None = None  # monotonic deadline; auto-finish on win
+        self._closing_total: float = 3.0
 
         self._fetch_q: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.server_sock: socket.socket | None = None
@@ -194,9 +232,25 @@ class Wrapper:
 
     def _on_resize(self) -> None:
         self.layout.refresh()
+        self.spec = self._build_spec()
         self._sync_winsize_to_child()
         if self.puzzle_active and self.overlay_supported:
-            self._place_overlay()
+            # Re-transmit so the image is rebuilt at the new effective scale.
+            self._update_overlay()
+
+    def _build_spec(self) -> overlay.OverlaySpec:
+        """Build the overlay spec, downscaling proportionally if the terminal
+        can't fit the requested size. This keeps the chess pieces' aspect
+        ratio correct — every dimension scales together."""
+        requested = overlay.OverlaySpec.from_scale(self.settings.size)
+        needed_w, needed_h = requested.cell_size()
+        # Reserve a couple of cells of breathing room on each axis.
+        max_w = max(1, self.layout.cols - 2)
+        max_h = max(1, self.layout.rows - 2)
+        if needed_w <= max_w and needed_h <= max_h:
+            return requested
+        downscale = min(max_w / needed_w, max_h / needed_h)
+        return overlay.OverlaySpec.from_scale(self.settings.size * downscale)
 
     # ── Socket ─────────────────────────────────────────────────────────
 
@@ -254,6 +308,7 @@ class Wrapper:
                     self._drain_socket()
 
             self._drain_fetch_queue()
+            self._tick_closing()
 
     # ── Input from user terminal ───────────────────────────────────────
 
@@ -316,8 +371,41 @@ class Wrapper:
         r = s.try_move(text.strip())
         self._show_move_result(r)
         if s.finished:
-            self._finish_puzzle()
+            if s.won:
+                # Show celebration + countdown; auto-destruct after ~3s.
+                self.closing_at = time.monotonic() + self._closing_total
+                self.status_msg = ""
+                self._update_celebration_banner()
+                self._update_overlay()
+            else:
+                self._finish_puzzle()
         else:
+            self._update_overlay()
+
+    def _update_celebration_banner(self) -> None:
+        if self.closing_at is None:
+            return
+        remaining = max(0.0, self.closing_at - time.monotonic())
+        secs = max(1, int(round(remaining))) if remaining > 0 else 0
+        if self.claude_idle:
+            self.banner = f"★ Solved!  ·  auto-destruct in {secs}…"
+        else:
+            self.banner = (
+                f"★ You solved it before Claude finished thinking!  ·  "
+                f"auto-destruct in {secs}…"
+            )
+
+    def _tick_closing(self) -> None:
+        if self.closing_at is None:
+            return
+        remaining = self.closing_at - time.monotonic()
+        if remaining <= 0:
+            self.closing_at = None
+            self._finish_puzzle()
+            return
+        old = self.banner
+        self._update_celebration_banner()
+        if self.banner != old:
             self._update_overlay()
 
     # ── Output from Claude ─────────────────────────────────────────────
@@ -352,6 +440,8 @@ class Wrapper:
         self.snoop_buffer = ""
         self.status_msg = "fetching puzzle…"
         self.banner = ""
+        self.claude_idle = False
+        self.closing_at = None
         self._update_overlay()
 
         threading.Thread(target=self._fetch_worker, daemon=True).start()
@@ -385,6 +475,13 @@ class Wrapper:
     def _on_idle(self) -> None:
         if not self.puzzle_active:
             return
+        self.claude_idle = True
+        if self.closing_at is not None:
+            # Mid-celebration; the next countdown tick will pick up the
+            # post-claude banner flavour.
+            self._update_celebration_banner()
+            self._update_overlay()
+            return
         self.status_msg = ""
         self.banner = "✓ Claude is done — finish at your leisure."
         self._update_overlay()
@@ -400,6 +497,7 @@ class Wrapper:
         self.puzzle_active = False
         self.fetch_pending = False
         self.session = None
+        self.closing_at = None
         if self.overlay_supported and self.image_transmitted:
             write_raw(sys.stdout.fileno(), overlay.kitty_delete(IMAGE_ID))
             self.image_transmitted = False
@@ -407,15 +505,20 @@ class Wrapper:
     # ── Overlay rendering ──────────────────────────────────────────────
 
     def _update_overlay(self) -> None:
-        """Regenerate the image and (re)transmit it, then place at top-right."""
+        """Regenerate the image and (re)transmit it, then place at the configured anchor.
+        The spec is already pre-scaled to fit, so we pass cells_w/cells_h that
+        match the spec (no distortion — pieces stay square)."""
         if not (self.puzzle_active and self.overlay_supported):
             return
-        png = overlay.render_png(self.session, self.status_msg, self.banner)
+        png = overlay.render_png(
+            self.session, self.status_msg, self.banner, self.spec,
+        )
+        cells_w, cells_h = self.spec.cell_size()
         out = bytearray()
         out += cursor_save()
-        anchor_row, anchor_col = self.layout.overlay_anchor()
+        anchor_row, anchor_col = self.layout.overlay_anchor(self.spec, self.settings.position)
         out += goto(anchor_row, anchor_col)
-        out += overlay.kitty_transmit(png, IMAGE_ID)
+        out += overlay.kitty_transmit(png, IMAGE_ID, cells_w=cells_w, cells_h=cells_h)
         out += cursor_restore()
         write_raw(sys.stdout.fileno(), bytes(out))
         self.image_transmitted = True
@@ -431,7 +534,7 @@ class Wrapper:
             return
         out = bytearray()
         out += cursor_save()
-        anchor_row, anchor_col = self.layout.overlay_anchor()
+        anchor_row, anchor_col = self.layout.overlay_anchor(self.spec, self.settings.position)
         out += goto(anchor_row, anchor_col)
         out += overlay.kitty_place(IMAGE_ID)
         out += cursor_restore()

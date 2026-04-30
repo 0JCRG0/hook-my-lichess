@@ -41,6 +41,28 @@ The `%` is consumed by the wrapper, and the move characters are wiped from Claud
 
 When Claude finishes, the puzzle stays open with a "Claude is done" status. Quit any time with `q%`.
 
+## Customizing
+
+Drop a `settings.json` to tune size and position. The wrapper looks in (priority order):
+
+1. `$HML_CONFIG` (if set)
+2. `<cwd>/hml.json`
+3. `~/.config/hml/settings.json`
+
+Schema (Pydantic v2):
+
+```json
+{
+  "size": "xxl",
+  "position": "center"
+}
+```
+
+- **`size`** — one of `"small"` (0.75×), `"medium"` (1×, default), `"large"` (1.25×), `"xl"` (1.5×), `"xxl"` (2×), or any positive number for an exact scale (e.g. `"size": 1.7`).
+- **`position`** — one of `"top-right"` (default), `"top-left"`, `"bottom-right"`, `"bottom-left"`, `"center"`, or a `[row, col]` pair for an exact 1-indexed cell (e.g. `"position": [3, 80]`).
+
+There's a sample at `settings.example.json` in this repo. Copy it to `~/.config/hml/settings.json` to apply it everywhere.
+
 ## Going global
 
 Hooks live in this project's `.claude/settings.json`. To make the overlay appear in any project, copy the `hooks` block to `~/.claude/settings.json` with absolute paths to the hook scripts in this repo.

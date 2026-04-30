@@ -4,15 +4,19 @@ it on top of Claude's TUI without making Claude re-layout.
 Graphics protocol reference: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 Works in Ghostty, Kitty, WezTerm. We detect support via env vars and
 no-op on unsupported terminals.
+
+All dimensions live on `OverlaySpec`. The wrapper builds a spec from the
+user's `settings.size` (preset name or numeric scale) and threads it
+through `render_png` and `image_cell_size`.
 """
 
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import os
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Optional
 
 import chess
@@ -39,17 +43,64 @@ def is_supported() -> bool:
     return False
 
 
-# ── Image generation ──────────────────────────────────────────────────────
+# ── Spec ───────────────────────────────────────────────────────────────────
 
 
-SQUARE_PX = 64
-BOARD_PX = SQUARE_PX * 8                       # 512
-HEADER_PX = 70
-STATUS_PX = 96
-PADDING_PX = 14
-LABEL_GUTTER_PX = 24                            # space for rank (left) and file (bottom) labels
-IMG_W = LABEL_GUTTER_PX + BOARD_PX + 2 * PADDING_PX                       # 568
-IMG_H = HEADER_PX + BOARD_PX + LABEL_GUTTER_PX + STATUS_PX + 2 * PADDING_PX  # 730
+@dataclass(frozen=True)
+class OverlaySpec:
+    square_px: int = 64
+    header_h: int = 76
+    status_h: int = 44
+    padding: int = 14
+    label_gutter: int = 30
+    piece_pt: int = 56
+    ui_pt: int = 26
+    ui_small_pt: int = 20
+    label_pt: int = 22
+
+    @classmethod
+    def from_scale(cls, scale: float) -> "OverlaySpec":
+        d = cls()
+        return cls(**{
+            f.name: max(1, int(round(getattr(d, f.name) * scale)))
+            for f in dataclasses.fields(cls)
+        })
+
+    @property
+    def board_px(self) -> int:
+        return self.square_px * 8
+
+    @property
+    def img_w(self) -> int:
+        return self.label_gutter + self.board_px + 2 * self.padding
+
+    @property
+    def img_h(self) -> int:
+        return (
+            self.header_h
+            + self.board_px
+            + self.label_gutter
+            + self.status_h
+            + 2 * self.padding
+        )
+
+    def cell_size(self) -> tuple[int, int]:
+        """Approx cells the image will occupy. We bias slightly wide on the
+        column axis so kitty stretches the image horizontally — chess piece
+        glyphs render visibly wider this way."""
+        return (max(1, self.img_w // 11), max(1, self.img_h // 28))
+
+
+DEFAULT_SPEC = OverlaySpec()
+
+
+# Backwards-compat helper for older callers.
+def image_cell_size(spec: OverlaySpec = DEFAULT_SPEC) -> tuple[int, int]:
+    return spec.cell_size()
+
+
+# ── Colours ────────────────────────────────────────────────────────────────
+
 
 LIGHT_SQ = (240, 217, 181)
 DARK_SQ = (181, 136, 99)
@@ -59,6 +110,7 @@ FG = (235, 235, 235)
 DIM = (160, 160, 165)
 GREEN = (88, 207, 138)
 RED = (220, 100, 110)
+
 
 PIECE_GLYPH = {
     chess.PAWN: "♟",
@@ -105,7 +157,6 @@ def _load_font(candidates: list[str], size: int) -> ImageFont.ImageFont:
 
 
 def _glyph_supported(font: ImageFont.ImageFont) -> bool:
-    """Check if the font has the chess unicode glyph for ♟ (0x265F)."""
     try:
         return font.getbbox("♟")[2] > 0  # type: ignore[attr-defined]
     except Exception:
@@ -121,71 +172,83 @@ class _Fonts:
     label: ImageFont.ImageFont
 
 
-_fonts_cache: Optional[_Fonts] = None
+_fonts_cache: dict[tuple[int, int, int, int], _Fonts] = {}
 
 
-def _fonts() -> _Fonts:
-    global _fonts_cache
-    if _fonts_cache is not None:
-        return _fonts_cache
-    piece = _load_font(FONT_CANDIDATES, 52)
-    ui = _load_font(UI_FONT_CANDIDATES, 24)
-    ui_small = _load_font(UI_FONT_CANDIDATES, 18)
-    label = _load_font(UI_FONT_CANDIDATES, 14)
-    _fonts_cache = _Fonts(
+def _fonts(spec: OverlaySpec) -> _Fonts:
+    key = (spec.piece_pt, spec.ui_pt, spec.ui_small_pt, spec.label_pt)
+    cached = _fonts_cache.get(key)
+    if cached is not None:
+        return cached
+    piece = _load_font(FONT_CANDIDATES, spec.piece_pt)
+    ui = _load_font(UI_FONT_CANDIDATES, spec.ui_pt)
+    ui_small = _load_font(UI_FONT_CANDIDATES, spec.ui_small_pt)
+    label = _load_font(UI_FONT_CANDIDATES, spec.label_pt)
+    f = _Fonts(
         piece=piece,
         piece_supports_glyphs=_glyph_supported(piece),
         ui=ui,
         ui_small=ui_small,
         label=label,
     )
-    return _fonts_cache
+    _fonts_cache[key] = f
+    return f
+
+
+# ── Image rendering ────────────────────────────────────────────────────────
 
 
 def render_png(
     session: PuzzleSession | None,
     status_msg: str,
     banner: str,
+    spec: OverlaySpec = DEFAULT_SPEC,
 ) -> bytes:
-    fonts = _fonts()
-    img = Image.new("RGB", (IMG_W, IMG_H), BG)
+    fonts = _fonts(spec)
+    img = Image.new("RGB", (spec.img_w, spec.img_h), BG)
     d = ImageDraw.Draw(img)
 
-    # Header
+    # Header.
     if session is not None:
         s = session
-        title = f"♟ {s.p.id}  {s.p.rating}"
+        title = f"Puzzle #{s.p.id}  ·  Rating {s.p.rating}  ·  {s.p.plays:,} plays"
         themes = ", ".join(s.p.themes[:3])
-        sub = f"play {board_mod.chess.COLOR_NAMES[s.p.user_color]} · {themes}"
+        sub = f"play {board_mod.chess.COLOR_NAMES[s.p.user_color]}  ·  {themes}"
     else:
-        title = "♟ Lichess puzzle"
+        title = "Lichess puzzle"
         sub = "fetching…"
-    d.text((PADDING_PX, PADDING_PX), title, fill=FG, font=fonts.ui)
-    d.text((PADDING_PX, PADDING_PX + 30), sub, fill=DIM, font=fonts.ui_small)
+    d.text((spec.padding, spec.padding), title, fill=FG, font=fonts.ui)
+    d.text(
+        (spec.padding, spec.padding + int(round(spec.ui_pt * 1.4))),
+        sub, fill=DIM, font=fonts.ui_small,
+    )
 
-    # Board (offset right by the rank-label gutter)
+    # Board.
     perspective = session.p.user_color if session is not None else chess.WHITE
-    board_origin = (PADDING_PX + LABEL_GUTTER_PX, HEADER_PX + PADDING_PX)
+    board_origin = (spec.padding + spec.label_gutter, spec.header_h + spec.padding)
     if session is not None:
-        _draw_board(d, session, board_origin, fonts)
+        _draw_board(d, session, board_origin, fonts, spec)
     else:
-        _draw_empty_board(d, board_origin)
+        _draw_empty_board(d, board_origin, spec)
         msg = "fetching puzzle…"
         bbox = d.textbbox((0, 0), msg, font=fonts.ui)
         w = bbox[2] - bbox[0]
         d.text(
-            (board_origin[0] + (BOARD_PX - w) / 2,
-             board_origin[1] + BOARD_PX / 2 - 12),
+            (board_origin[0] + (spec.board_px - w) / 2,
+             board_origin[1] + spec.board_px / 2 - 12),
             msg, fill=FG, font=fonts.ui,
         )
-    _draw_grid_labels(d, board_origin, perspective, fonts)
+    _draw_grid_labels(d, board_origin, perspective, fonts, spec)
 
-    # Status (banner takes precedence — Claude is done message)
-    status_origin_y = HEADER_PX + BOARD_PX + LABEL_GUTTER_PX + PADDING_PX
+    # Status / banner share one area.
+    status_origin_y = spec.header_h + spec.board_px + spec.label_gutter + spec.padding
     text, color = _status_text_and_color(session, status_msg, banner)
-    _wrap_text(d, text, (PADDING_PX, status_origin_y),
-               max_width=IMG_W - 2 * PADDING_PX, font=fonts.ui_small,
-               fill=color, line_height=24)
+    _wrap_text(
+        d, text, (spec.padding, status_origin_y),
+        max_width=spec.img_w - 2 * spec.padding,
+        font=fonts.ui_small, fill=color,
+        line_height=int(round(spec.ui_small_pt * 1.2)),
+    )
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -197,6 +260,7 @@ def _draw_board(
     s: PuzzleSession,
     origin: tuple[int, int],
     fonts: _Fonts,
+    spec: OverlaySpec,
 ) -> None:
     ox, oy = origin
     perspective = s.p.user_color
@@ -213,14 +277,17 @@ def _draw_board(
             sq = chess.square(f, r)
             is_light = (chess.square_file(sq) + chess.square_rank(sq)) % 2 == 1
             color = HILITE if sq in hilite_squares else (LIGHT_SQ if is_light else DARK_SQ)
-            x0 = ox + cx * SQUARE_PX
-            y0 = oy + ry * SQUARE_PX
-            d.rectangle([x0, y0, x0 + SQUARE_PX - 1, y0 + SQUARE_PX - 1], fill=color)
+            x0 = ox + cx * spec.square_px
+            y0 = oy + ry * spec.square_px
+            d.rectangle(
+                [x0, y0, x0 + spec.square_px - 1, y0 + spec.square_px - 1],
+                fill=color,
+            )
 
             piece = s.p.board.piece_at(sq)
             if piece is None:
                 continue
-            _draw_piece(d, piece, (x0, y0), fonts)
+            _draw_piece(d, piece, (x0, y0), fonts, spec)
 
 
 def _draw_grid_labels(
@@ -228,9 +295,8 @@ def _draw_grid_labels(
     origin: tuple[int, int],
     perspective: chess.Color,
     fonts: _Fonts,
+    spec: OverlaySpec,
 ) -> None:
-    """Rank numbers (1-8) on the left of each row, files (a-h) on the
-    bottom of each column. Orientation follows the user's perspective."""
     ox, oy = origin
     ranks = range(7, -1, -1) if perspective == chess.WHITE else range(0, 8)
     files = range(0, 8) if perspective == chess.WHITE else range(7, -1, -1)
@@ -240,8 +306,8 @@ def _draw_grid_labels(
         bbox = d.textbbox((0, 0), text, font=fonts.label)
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        x = ox - LABEL_GUTTER_PX + (LABEL_GUTTER_PX - w) / 2 - bbox[0]
-        y = oy + ry * SQUARE_PX + (SQUARE_PX - h) / 2 - bbox[1]
+        x = ox - spec.label_gutter + (spec.label_gutter - w) / 2 - bbox[0]
+        y = oy + ry * spec.square_px + (spec.square_px - h) / 2 - bbox[1]
         d.text((x, y), text, fill=DIM, font=fonts.label)
 
     for cx, f in enumerate(files):
@@ -249,20 +315,27 @@ def _draw_grid_labels(
         bbox = d.textbbox((0, 0), text, font=fonts.label)
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        x = ox + cx * SQUARE_PX + (SQUARE_PX - w) / 2 - bbox[0]
-        y = oy + BOARD_PX + (LABEL_GUTTER_PX - h) / 2 - bbox[1]
+        x = ox + cx * spec.square_px + (spec.square_px - w) / 2 - bbox[0]
+        y = oy + spec.board_px + (spec.label_gutter - h) / 2 - bbox[1]
         d.text((x, y), text, fill=DIM, font=fonts.label)
 
 
-def _draw_empty_board(d: ImageDraw.ImageDraw, origin: tuple[int, int]) -> None:
+def _draw_empty_board(
+    d: ImageDraw.ImageDraw,
+    origin: tuple[int, int],
+    spec: OverlaySpec,
+) -> None:
     ox, oy = origin
     for r in range(8):
         for f in range(8):
             is_light = (f + r) % 2 == 1
             color = LIGHT_SQ if is_light else DARK_SQ
-            x0 = ox + f * SQUARE_PX
-            y0 = oy + r * SQUARE_PX
-            d.rectangle([x0, y0, x0 + SQUARE_PX - 1, y0 + SQUARE_PX - 1], fill=color)
+            x0 = ox + f * spec.square_px
+            y0 = oy + r * spec.square_px
+            d.rectangle(
+                [x0, y0, x0 + spec.square_px - 1, y0 + spec.square_px - 1],
+                fill=color,
+            )
 
 
 def _draw_piece(
@@ -270,20 +343,18 @@ def _draw_piece(
     piece: chess.Piece,
     square_origin: tuple[int, int],
     fonts: _Fonts,
+    spec: OverlaySpec,
 ) -> None:
     sx, sy = square_origin
     if fonts.piece_supports_glyphs:
         glyph = PIECE_GLYPH[piece.piece_type]
-        # Outline + fill for visibility on both light and dark squares.
         outline = (0, 0, 0) if piece.color == chess.WHITE else (255, 255, 255)
         fill = (255, 255, 255) if piece.color == chess.WHITE else (0, 0, 0)
-        # Center the glyph in the square.
         bbox = d.textbbox((0, 0), glyph, font=fonts.piece)
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        cx = sx + (SQUARE_PX - w) / 2 - bbox[0]
-        cy = sy + (SQUARE_PX - h) / 2 - bbox[1]
-        # Draw thin outline first.
+        cx = sx + (spec.square_px - w) / 2 - bbox[0]
+        cy = sy + (spec.square_px - h) / 2 - bbox[1]
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             d.text((cx + dx, cy + dy), glyph, font=fonts.piece, fill=outline)
         d.text((cx, cy), glyph, font=fonts.piece, fill=fill)
@@ -294,8 +365,8 @@ def _draw_piece(
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
         d.text(
-            (sx + (SQUARE_PX - w) / 2 - bbox[0],
-             sy + (SQUARE_PX - h) / 2 - bbox[1]),
+            (sx + (spec.square_px - w) / 2 - bbox[0],
+             sy + (spec.square_px - h) / 2 - bbox[1]),
             letter, font=fonts.piece, fill=fill,
         )
 
@@ -316,7 +387,7 @@ def _status_text_and_color(
     if session is None:
         return "loading…", DIM
     if session.finished and session.won:
-        return "🏆 solved!", GREEN
+        return "★ solved!", GREEN
     if session.finished:
         return "puzzle ended.", DIM
     return "type your move into Claude's input + %  (e.g. e2e4%)", DIM
@@ -367,15 +438,30 @@ def _kitty(payload: str) -> bytes:
     return f"\x1b_G{payload}\x1b\\".encode()
 
 
-def kitty_transmit(png: bytes, image_id: int) -> bytes:
-    """Transmit + display a PNG image at the current cursor position.
-    Uses chunked encoding so we can send larger images."""
+def kitty_transmit(
+    png: bytes,
+    image_id: int,
+    cells_w: int | None = None,
+    cells_h: int | None = None,
+) -> bytes:
+    """Transmit + display an image.
+
+    Always sets C=1 so the cursor does NOT move after placement (otherwise
+    a too-tall image scrolls the whole terminal). When cells_w / cells_h
+    are passed, kitty scales the image to that exact cell box, which lets
+    us cap the image to the available terminal area.
+    """
+    extras = ",C=1"
+    if cells_w is not None:
+        extras += f",c={cells_w}"
+    if cells_h is not None:
+        extras += f",r={cells_h}"
     b64 = base64.b64encode(png).decode("ascii")
     if len(b64) <= CHUNK:
-        return _kitty(f"a=T,f=100,i={image_id},q=2;{b64}")
+        return _kitty(f"a=T,f=100,i={image_id},q=2{extras};{b64}")
     parts = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
     out = bytearray()
-    out += _kitty(f"a=T,f=100,i={image_id},q=2,m=1;{parts[0]}")
+    out += _kitty(f"a=T,f=100,i={image_id},q=2{extras},m=1;{parts[0]}")
     for p in parts[1:-1]:
         out += _kitty(f"m=1;{p}")
     out += _kitty(f"m=0;{parts[-1]}")
@@ -383,22 +469,8 @@ def kitty_transmit(png: bytes, image_id: int) -> bytes:
 
 
 def kitty_place(image_id: int, placement_id: int = 1) -> bytes:
-    """Re-place an already-transmitted image at the current cursor."""
-    return _kitty(f"a=p,i={image_id},p={placement_id},q=2")
+    return _kitty(f"a=p,i={image_id},p={placement_id},C=1,q=2")
 
 
 def kitty_delete(image_id: int) -> bytes:
-    """Delete an image (and any placements). Use a=d for dispose."""
     return _kitty(f"a=d,d=I,i={image_id},q=2")
-
-
-# ── Cell sizing ────────────────────────────────────────────────────────────
-
-
-def image_cell_size() -> tuple[int, int]:
-    """Approximate cells the image will occupy. Tunable for layout
-    calculations in the wrapper. Cells are typically ~10×20 px on
-    Retina-class displays."""
-    cols = max(1, IMG_W // 14)   # ~29 cells wide
-    rows = max(1, IMG_H // 28)   # ~19 cells tall
-    return cols, rows
