@@ -291,8 +291,12 @@ class Wrapper:
         sel.register(self.server_sock.fileno(), selectors.EVENT_READ, "sock")
 
         while True:
+            # Tighter tick when a puzzle is up so the overlay re-places
+            # itself even when Claude is silent (e.g., right after a
+            # scroll completes). 0.5 s otherwise to stay cheap.
+            timeout = 0.05 if self.puzzle_active else 0.5
             try:
-                events = sel.select(timeout=0.5)
+                events = sel.select(timeout=timeout)
             except InterruptedError:
                 continue
 
@@ -309,6 +313,8 @@ class Wrapper:
 
             self._drain_fetch_queue()
             self._tick_closing()
+            if self.puzzle_active and self.overlay_supported:
+                self._place_overlay()
 
     # ── Input from user terminal ───────────────────────────────────────
 
@@ -507,7 +513,10 @@ class Wrapper:
     def _update_overlay(self) -> None:
         """Regenerate the image and (re)transmit it, then place at the configured anchor.
         The spec is already pre-scaled to fit, so we pass cells_w/cells_h that
-        match the spec (no distortion — pieces stay square)."""
+        match the spec (no distortion — pieces stay square).
+
+        Always deletes the existing placement first so an old placement that
+        was carried up by terminal scrolling is reaped explicitly."""
         if not (self.puzzle_active and self.overlay_supported):
             return
         png = overlay.render_png(
@@ -516,6 +525,8 @@ class Wrapper:
         cells_w, cells_h = self.spec.cell_size()
         out = bytearray()
         out += cursor_save()
+        if self.image_transmitted:
+            out += overlay.kitty_delete_placement(IMAGE_ID, 1)
         anchor_row, anchor_col = self.layout.overlay_anchor(self.spec, self.settings.position)
         out += goto(anchor_row, anchor_col)
         out += overlay.kitty_transmit(png, IMAGE_ID, cells_w=cells_w, cells_h=cells_h)
@@ -526,14 +537,19 @@ class Wrapper:
 
     def _place_overlay(self) -> None:
         """Re-place the existing image without retransmitting bytes (cheap).
-        Throttled so we don't flood the terminal on every claude tick."""
+        Throttled to ~60 Hz to coalesce bursts but still catch each scroll.
+
+        Deletes the previous placement before creating the new one — that's
+        what kills the 'ghost' image left behind when Claude's output
+        scrolls the terminal."""
         if not (self.puzzle_active and self.overlay_supported and self.image_transmitted):
             return
         now = time.monotonic()
-        if now - self.last_overlay_t < 0.05:
+        if now - self.last_overlay_t < 0.016:
             return
         out = bytearray()
         out += cursor_save()
+        out += overlay.kitty_delete_placement(IMAGE_ID, 1)
         anchor_row, anchor_col = self.layout.overlay_anchor(self.spec, self.settings.position)
         out += goto(anchor_row, anchor_col)
         out += overlay.kitty_place(IMAGE_ID)

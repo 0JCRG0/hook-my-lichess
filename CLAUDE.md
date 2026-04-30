@@ -109,14 +109,31 @@ This is the thing to understand before editing `wrapper.py`:
    - On `WORKING`: render PNG, transmit with `a=T,C=1,c=…,r=…` (`C=1`
      so the cursor doesn't move and the image doesn't scroll the
      screen; `c`/`r` cap the image to the available cell box).
-   - On every byte from Claude (`_handle_master`): re-place the
-     existing image with `a=p` so it stays on top of scrolls. This is
-     throttled to once per 50 ms so we don't flood the terminal.
+   - On every byte from Claude (`_handle_master`) and on each event
+     loop tick while a puzzle is active: re-place the existing image
+     so it stays on top of scrolls. Re-place is throttled to ~60 Hz
+     (`0.016 s`).
+   - **Always delete the placement before re-placing it.** Both
+     `_update_overlay` and `_place_overlay` emit `kitty_delete_placement`
+     (`a=d,d=i`) before the new `a=p`/`a=T`. Relying on "same
+     placement_id replaces the old one" semantics is unreliable across
+     Kitty/Ghostty/WezTerm versions and leaves ghost copies of the
+     image in the scrollback when Claude's output scrolls. The
+     delete-then-place pattern is what kills those ghosts. There are
+     two delete helpers in `overlay.py` — `kitty_delete_placement`
+     (`d=i`, drops one placement, keeps image bytes cached) and
+     `kitty_delete` (`d=I`, drops the image and all placements); use
+     the placement variant on every re-place, and the full variant
+     only on puzzle finish / wrapper exit.
    - On `IDLE`: regenerate the image with the "✓ Claude is done"
      banner.
-   - On puzzle finish / wrapper exit: delete the image with `a=d`.
+   - On puzzle finish / wrapper exit: delete the image with
+     `kitty_delete` (`a=d,d=I`).
    - Cursor is always saved (`ESC 7`) before any overlay write and
      restored (`ESC 8`) after, so Claude's TUI cursor isn't disturbed.
+   - The main loop's `select` timeout is 50 ms while a puzzle is up
+     (so re-place keeps firing even when Claude is silent right after
+     a scroll completes) and 0.5 s otherwise.
 5. **Snoop-and-`%` input model.** When a puzzle is active, every
    stdin byte is *forwarded to Claude as normal* and *also fed into
    `snoop_buffer`*. The buffer is reset on Enter / ESC / Ctrl-C; only

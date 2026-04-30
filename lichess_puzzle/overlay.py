@@ -472,5 +472,14 @@ def kitty_place(image_id: int, placement_id: int = 1) -> bytes:
     return _kitty(f"a=p,i={image_id},p={placement_id},C=1,q=2")
 
 
+def kitty_delete_placement(image_id: int, placement_id: int = 1) -> bytes:
+    """Delete just the placement (keep image data cached). Use this between
+    re-places to kill any old placement that scrolled into the buffer —
+    relying on 'same placement_id replaces' semantics is unreliable across
+    Kitty/Ghostty/WezTerm versions."""
+    return _kitty(f"a=d,d=i,i={image_id},p={placement_id},q=2")
+
+
 def kitty_delete(image_id: int) -> bytes:
+    """Delete the image and all its placements (frees image storage)."""
     return _kitty(f"a=d,d=I,i={image_id},q=2")
