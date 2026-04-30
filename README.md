@@ -1,19 +1,12 @@
 # hook-my-lichess
 
-A Lichess puzzle that lives in the **same terminal** as Claude Code. While
-Claude is working on a task, the bottom of your terminal becomes a chess
-board you can solve with the keyboard. When Claude finishes, the puzzle
-gets out of the way.
+A Lichess puzzle that floats over the **same terminal** Claude Code is running in. While Claude is working, the puzzle hovers in the top-right corner; you keep typing into Claude's input box, and a special terminator sends your move to the puzzle.
 
 It works by wrapping `claude` in a small PTY proxy that:
 
-- Uses `DECSTBM` (set scrolling region) to confine Claude's output to the
-  top of the terminal — no Kitty graphics required, works in iTerm2,
-  Ghostty, Terminal.app, anything with a real VT.
-- Listens on a Unix socket for `WORKING` / `IDLE` events from
-  Claude Code's `UserPromptSubmit` and `Stop` hooks.
-- Routes your keystrokes to the puzzle's line editor while Claude is busy,
-  and back to Claude when it's idle. Toggle anytime with **Ctrl-G**.
+- Listens on a Unix socket for `WORKING` / `IDLE` events from Claude Code's `UserPromptSubmit` and `Stop` hooks.
+- Renders the puzzle to a PNG and floats it via the **Kitty graphics protocol** — a true overlay layer above the text grid. Claude is not resized and never sees the image.
+- Snoops the keystrokes you type into Claude's input. When the snooped text looks like a chess move and ends with `%`, the wrapper intercepts: it parses the move, sends backspaces back to Claude so the prefix gets wiped from Claude's input field, and updates the puzzle. Pressing Enter as normal still sends your line to Claude.
 
 ## Setup
 
@@ -22,12 +15,8 @@ cd /Users/juanreyesgarcia/Dev/hook-my-lichess
 python3 -m venv .venv
 .venv/bin/pip install -e .
 cp .env.example .env
-# put your token (https://lichess.org/account/oauth/token) in .env
+# put your Lichess personal token in .env
 ```
-
-The hook scripts are already wired in `.claude/settings.json`. They only do
-anything when the `HML_SOCKET` env var is set — i.e. when Claude is launched
-through `hml`.
 
 ## Run it
 
@@ -36,44 +25,31 @@ cd /Users/juanreyesgarcia/Dev/hook-my-lichess
 .venv/bin/hml claude
 ```
 
-(Or alias it: `alias hclaude='/full/path/to/.venv/bin/hml claude'`.)
+The wrapper auto-detects whether the terminal supports Kitty graphics (Ghostty, Kitty, WezTerm). On other terminals (iTerm2, Terminal.app, tmux, …) it just runs Claude transparently — no overlay, no resize, no surprises.
 
-Submit any prompt. The bottom of your terminal will paint a board with the
-**puzzle focus** chip lit. Type your move and hit Enter:
+## Usage in the puzzle
 
-- `e2e4` (UCI) or `Nf3` (SAN) — submit a move
-- `h` — hint (which square the piece moves from)
-- `s` — give up and reveal the move
-- `q` — quit the puzzle
-- `Ctrl-G` — toggle keyboard focus between puzzle and Claude (e.g. to
-  Esc-interrupt Claude or hit Enter for permission prompts)
+Submit any prompt to Claude. A board image appears in the top-right corner. Type your move directly into Claude's input box and end with `%`:
 
-When Claude finishes its turn, the puzzle stays open with a
-**"Claude is done — finish at your leisure"** banner. Hit Ctrl-G to give
-focus back to Claude or finish the puzzle first.
+- `e2e4%` — submit a UCI move
+- `Nf3%` — submit a SAN move
+- `h%` — hint (which square the piece moves from)
+- `s%` — give up and reveal the move
+- `q%` — quit the puzzle
+
+The `%` is consumed by the wrapper, and the move characters are wiped from Claude's input via backspaces. **Pressing Enter still sends your line to Claude as normal.** A literal `%` after non-move text (`"wait 30%"`) passes through untouched.
+
+When Claude finishes, the puzzle stays open with a "Claude is done" status. Quit any time with `q%`.
 
 ## Going global
 
-Right now the hooks live in this project's `.claude/settings.json`, so the
-puzzle only appears when you run `hml claude` from inside this directory.
-To make it work in any project, copy the `hooks` block from
-`.claude/settings.json` into `~/.claude/settings.json`, swapping
-`$CLAUDE_PROJECT_DIR/.claude/hooks/...` for the absolute paths to the
-scripts in this repo.
+Hooks live in this project's `.claude/settings.json`. To make the overlay appear in any project, copy the `hooks` block to `~/.claude/settings.json` with absolute paths to the hook scripts in this repo.
 
-## Troubleshooting
+## Force-enable the overlay (debugging)
 
-- **Puzzle area gets clobbered by Claude's output.** Some Claude Code
-  rendering paths print past the scrolling region. Resize the terminal
-  (the wrapper redraws on `SIGWINCH`) or hit Ctrl-G twice to force a
-  redraw.
-- **Nothing happens.** Confirm `HML_SOCKET` reaches the hook by adding
-  `env | grep HML >> /tmp/hml.log` at the top of `on-start.sh`. If it's
-  empty, you launched `claude` directly instead of via `hml`.
-- **Token errors.** `.env` has to be in this project's root and contain
-  `LICHESS_TOKEN=lip_xxx`.
+Set `HML_FORCE_OVERLAY=1` to bypass the terminal-detection heuristic and always emit Kitty graphics escape sequences.
 
-## Standalone puzzle (debugging)
+## Standalone puzzle (debugging the engine)
 
 Skip the wrapper entirely:
 
@@ -81,4 +57,4 @@ Skip the wrapper entirely:
 .venv/bin/lichess-puzzle
 ```
 
-Same engine, plain stdin loop.
+Plain stdin loop, same engine.

@@ -35,8 +35,11 @@ Two entry points, one engine.
 
 - `lichess_puzzle/engine.py` — `PuzzleSession`, an I/O-agnostic state machine
   that owns the board, current solution index, and `try_move()` semantics
-  (UCI/SAN parsing, hint/solve/quit commands, auto-playing the opponent's
-  reply on a correct move). Both the standalone CLI and the wrapper drive it.
+  (UCI/SAN parsing via `python-chess`, hint/solve/quit commands, auto-playing
+  the opponent's reply on a correct move). Both the standalone CLI and the
+  wrapper drive it. Move parsing tries SAN first, then falls back to UCI;
+  UCI input is lowercased before parsing but SAN is not, so `nf3` fails
+  while `Nf3` and `g1f3` both work.
 - `lichess_puzzle/board.py` — `parse_puzzle()` turns a Lichess `/api/puzzle/next`
   payload into a `Puzzle` dataclass. Lichess convention: replay `pgn[:initialPly]`
   to reach the position, then push `pgn[initialPly]` as the opponent's *setup*

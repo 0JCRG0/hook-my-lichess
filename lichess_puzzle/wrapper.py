@@ -1,35 +1,26 @@
-"""PTY-proxy wrapper that runs Claude Code as a child and overlays a Lichess
-puzzle in the bottom of the same terminal while Claude is working.
+"""PTY-proxy wrapper that runs Claude Code as a child and floats a
+Lichess-puzzle Kitty-graphics image over the same terminal while Claude
+is working.
 
 Usage: hml claude [<claude-args>...]
 
-v4 design (no focus toggle):
-  - Fork a PTY, exec the child argv inside it.
-  - Parent terminal goes raw; bytes are forwarded both ways.
-  - A Unix socket (path exported as $HML_SOCKET) lets hook scripts post
-    "WORKING" / "IDLE" lines to switch puzzle state.
-
+v5 design (Kitty graphics overlay, no scroll-region or PTY shrink):
+  - Fork a PTY, exec the child argv inside it. Forward bytes both ways.
   - When WORKING:
-      * shrink Claude's PTY to (full_rows - PUZZLE_ROWS, cols) and SIGWINCH.
-        Claude renders into the smaller top region.
-      * set DECSTBM to (1, claude_rows) on the user's terminal so any
-        scroll-up triggered by Claude's output cannot push our puzzle into
-        the scrollback. The bottom rows are physically pinned.
-      * fetch a puzzle in a background thread (no event-loop blocking);
-        the puzzle area shows "fetching…" until the result lands.
+      * fetch the puzzle in a background thread.
+      * render the puzzle as a PNG and transmit/place it at the top-right
+        of the user's terminal via the Kitty graphics protocol. Claude is
+        NOT resized — the image is on a separate layer above the text grid.
+      * snoop the user's keystrokes. When the snooped buffer ends with `%`
+        and looks like a chess move/command, intercept: parse it, send N
+        backspaces back to Claude so the chars get wiped from Claude's
+        input box, and update the puzzle image with the result.
+  - When IDLE: regenerate image with a "Claude is done" status.
+  - On finish/quit: delete the image; everything else returns to normal.
 
-  - Input: every keystroke is forwarded to Claude as normal. The wrapper
-    *also* snoops printable bytes (and backspaces) into a per-line buffer
-    that's reset on Enter. The terminator is `%`:
-        type your move, e.g.  e2e4%  (or h%  for hint, q%  to quit)
-        → wrapper consumes the `%`, parses the buffered text as a puzzle
-          move, sends N BACKSPACES to Claude so Claude's input field is
-          wiped clean, and updates the puzzle area with the result.
-    Pressing Enter as normal sends the line to Claude unchanged.
-
-  - When IDLE: puzzle stays drawn with a "Claude is done" banner.
-  - On finish/quit: DECSTBM reset, puzzle area cleared, PTY restored to
-    full size, SIGWINCH, all input flows back to Claude untouched.
+If the terminal doesn't support Kitty graphics (iTerm2, Terminal.app,
+tmux, ...) the wrapper still proxies Claude transparently but skips the
+overlay entirely.
 """
 
 from __future__ import annotations
@@ -52,7 +43,7 @@ import time
 import tty
 from pathlib import Path
 
-from . import api, board as board_mod, render
+from . import api, board as board_mod, overlay, render
 from .engine import PuzzleSession, MoveResult
 
 
@@ -60,13 +51,8 @@ CTRL_C = 0x03
 ESC_BYTE = 0x1b
 BACKSPACE = 0x7f
 TERMINATOR = ord("%")
+IMAGE_ID = 1729
 
-PUZZLE_ROWS = 14
-MIN_TERMINAL_ROWS = 22
-
-# Loose chess-move sanity check: snooped buffer must contain enough plausible
-# move characters before we accept a `%` as a puzzle terminator. Otherwise we
-# pass `%` through to Claude (so a literal `%` in a prompt still works).
 MOVE_RE = re.compile(r"[a-h1-8RNBQKO=+#xX\-O0]{2,}")
 COMMAND_TOKENS = {"h", "hint", "?", "s", "solve", "q", "quit"}
 
@@ -89,18 +75,6 @@ def goto(row: int, col: int) -> bytes:
     return f"{ESC}[{row};{col}H".encode()
 
 
-def clear_line() -> bytes:
-    return f"{ESC}[2K".encode()
-
-
-def set_scroll_region(top: int, bottom: int) -> bytes:
-    return f"{ESC}[{top};{bottom}r".encode()
-
-
-def reset_scroll_region() -> bytes:
-    return f"{ESC}[r".encode()
-
-
 # ── Layout ─────────────────────────────────────────────────────────────────
 
 
@@ -117,16 +91,11 @@ class Layout:
         except OSError:
             pass
 
-    @property
-    def claude_rows(self) -> int:
-        return max(1, self.rows - PUZZLE_ROWS)
-
-    @property
-    def puzzle_top(self) -> int:
-        return self.claude_rows + 1
-
-    def has_room_for_puzzle(self) -> bool:
-        return self.rows >= MIN_TERMINAL_ROWS
+    def overlay_anchor(self) -> tuple[int, int]:
+        """Return (row, col) where the image's top-left should sit (top-right corner)."""
+        cell_w, _ = overlay.image_cell_size()
+        col = max(1, self.cols - cell_w + 1)
+        return (1, col)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -155,10 +124,13 @@ class Wrapper:
         self.orig_attrs: list | None = None
         self.layout = Layout()
 
+        self.overlay_supported = overlay.is_supported()
+        self.image_transmitted: bool = False
+        self.last_overlay_t: float = 0.0
         self.session: PuzzleSession | None = None
         self.puzzle_active: bool = False
         self.fetch_pending: bool = False
-        self.snoop_buffer: str = ""  # what the user has typed since last Enter/%
+        self.snoop_buffer: str = ""
         self.status_msg: str = ""
         self.banner: str = ""
 
@@ -195,11 +167,8 @@ class Wrapper:
         try:
             self._loop()
         finally:
-            if self.puzzle_active:
-                # Clean up any active overlay before exiting.
-                write_raw(sys.stdout.fileno(), reset_scroll_region())
-                self._resize_child(self.layout.rows, self.layout.cols)
-            self._teardown_puzzle_layout()
+            if self.overlay_supported and self.image_transmitted:
+                write_raw(sys.stdout.fileno(), overlay.kitty_delete(IMAGE_ID))
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.orig_attrs)
             try:
                 self.socket_path.unlink()
@@ -214,29 +183,20 @@ class Wrapper:
 
     # ── Terminal/PTY plumbing ──────────────────────────────────────────
 
-    def _resize_child(self, rows: int, cols: int) -> None:
+    def _sync_winsize_to_child(self) -> None:
+        # Always pass the full terminal size — claude renders normally.
         try:
-            packed = struct.pack("HHHH", rows, cols, 0, 0)
+            packed = struct.pack("HHHH", self.layout.rows, self.layout.cols, 0, 0)
             fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, packed)
             os.kill(self.child_pid, signal.SIGWINCH)
         except OSError:
             pass
 
-    def _sync_winsize_to_child(self) -> None:
-        if self.puzzle_active:
-            self._resize_child(self.layout.claude_rows, self.layout.cols)
-        else:
-            self._resize_child(self.layout.rows, self.layout.cols)
-
     def _on_resize(self) -> None:
         self.layout.refresh()
-        if self.puzzle_active:
-            # Re-establish scroll region for the new size.
-            write_raw(sys.stdout.fileno(),
-                      set_scroll_region(1, self.layout.claude_rows))
         self._sync_winsize_to_child()
-        if self.puzzle_active:
-            self._redraw_puzzle()
+        if self.puzzle_active and self.overlay_supported:
+            self._place_overlay()
 
     # ── Socket ─────────────────────────────────────────────────────────
 
@@ -306,14 +266,12 @@ class Wrapper:
             return False
 
         if not self.puzzle_active:
-            # Pass-through: nothing to snoop or intercept.
             write_raw(self.master_fd, data)
             return True
 
         forward = bytearray()
         for b in data:
             if b == TERMINATOR and self._buffer_is_puzzle_command():
-                # Wipe the prefix from Claude's input (N backspaces) and submit.
                 if forward:
                     write_raw(self.master_fd, bytes(forward))
                     forward.clear()
@@ -324,22 +282,16 @@ class Wrapper:
                 self._submit_puzzle(text)
                 continue
 
-            # Mirror the byte into our buffer where appropriate.
             if b in (0x0d, 0x0a):
-                # Enter — user is sending to Claude. Reset our snoop buffer.
                 self.snoop_buffer = ""
             elif b == BACKSPACE or b == 0x08:
                 self.snoop_buffer = self.snoop_buffer[:-1]
             elif b == ESC_BYTE:
-                # Escape sequences (arrows, function keys, paste mode etc.)
-                # Don't try to interpret — just forward and reset our buffer
-                # so we never accidentally treat junk as a move.
                 self.snoop_buffer = ""
             elif b == CTRL_C:
                 self.snoop_buffer = ""
             elif 0x20 <= b < 0x7f:
                 self.snoop_buffer += chr(b)
-            # else: ignore for snoop purposes (bell, tab, etc.) but still forward
 
             forward.append(b)
 
@@ -348,28 +300,25 @@ class Wrapper:
         return True
 
     def _buffer_is_puzzle_command(self) -> bool:
-        """Return True iff the snoop buffer looks like a chess move/command —
-        otherwise we let the user type a literal `%` to Claude."""
         text = self.snoop_buffer.strip()
         if not text:
             return False
         if text.lower() in COMMAND_TOKENS:
             return True
-        # Loose move sanity check: ≥3 chars, only chess-move characters.
         return len(text) >= 3 and bool(MOVE_RE.fullmatch(text))
 
     def _submit_puzzle(self, text: str) -> None:
         s = self.session
         if s is None:
             self.status_msg = "puzzle still loading…"
-            self._redraw_puzzle()
+            self._update_overlay()
             return
         r = s.try_move(text.strip())
         self._show_move_result(r)
         if s.finished:
             self._finish_puzzle()
         else:
-            self._redraw_puzzle()
+            self._update_overlay()
 
     # ── Output from Claude ─────────────────────────────────────────────
 
@@ -381,8 +330,9 @@ class Wrapper:
         if not data:
             return False
         write_raw(sys.stdout.fileno(), data)
-        if self.puzzle_active:
-            self._redraw_puzzle()
+        if self.puzzle_active and self.overlay_supported:
+            # Re-place the existing image so it stays visible across scrolls.
+            self._place_overlay()
         return True
 
     # ── Puzzle lifecycle ───────────────────────────────────────────────
@@ -390,7 +340,9 @@ class Wrapper:
     def _start_puzzle(self) -> None:
         if self.puzzle_active or self.fetch_pending:
             return
-        if not self.layout.has_room_for_puzzle():
+        if not self.overlay_supported:
+            # Without graphics we don't render anything — proxy stays
+            # transparent. (Future: text fallback via DECSTBM.)
             return
 
         self.layout.refresh()
@@ -400,12 +352,7 @@ class Wrapper:
         self.snoop_buffer = ""
         self.status_msg = "fetching puzzle…"
         self.banner = ""
-
-        # Pin the bottom rows: the terminal must not scroll past claude_rows.
-        write_raw(sys.stdout.fileno(),
-                  set_scroll_region(1, self.layout.claude_rows))
-        self._resize_child(self.layout.claude_rows, self.layout.cols)
-        self._redraw_puzzle()
+        self._update_overlay()
 
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
@@ -433,14 +380,14 @@ class Wrapper:
                     self.status_msg = f"parse error: {e}"
             else:
                 self.status_msg = f"fetch failed: {value}"
-            self._redraw_puzzle()
+            self._update_overlay()
 
     def _on_idle(self) -> None:
         if not self.puzzle_active:
             return
         self.status_msg = ""
         self.banner = "✓ Claude is done — finish at your leisure."
-        self._redraw_puzzle()
+        self._update_overlay()
 
     def _finish_puzzle(self) -> None:
         if not self.puzzle_active:
@@ -453,97 +400,54 @@ class Wrapper:
         self.puzzle_active = False
         self.fetch_pending = False
         self.session = None
-        # Reset terminal: drop the scroll region first so subsequent writes
-        # can scroll the whole screen again.
-        write_raw(sys.stdout.fileno(), reset_scroll_region())
-        self._teardown_puzzle_layout()
-        self._resize_child(self.layout.rows, self.layout.cols)
+        if self.overlay_supported and self.image_transmitted:
+            write_raw(sys.stdout.fileno(), overlay.kitty_delete(IMAGE_ID))
+            self.image_transmitted = False
 
-    def _teardown_puzzle_layout(self) -> None:
+    # ── Overlay rendering ──────────────────────────────────────────────
+
+    def _update_overlay(self) -> None:
+        """Regenerate the image and (re)transmit it, then place at top-right."""
+        if not (self.puzzle_active and self.overlay_supported):
+            return
+        png = overlay.render_png(self.session, self.status_msg, self.banner)
         out = bytearray()
-        for r in range(self.layout.puzzle_top, self.layout.rows + 1):
-            out += goto(r, 1) + clear_line()
-        out += goto(self.layout.rows, 1)
+        out += cursor_save()
+        anchor_row, anchor_col = self.layout.overlay_anchor()
+        out += goto(anchor_row, anchor_col)
+        out += overlay.kitty_transmit(png, IMAGE_ID)
+        out += cursor_restore()
         write_raw(sys.stdout.fileno(), bytes(out))
+        self.image_transmitted = True
+        self.last_overlay_t = time.monotonic()
 
-    # ── Puzzle rendering ───────────────────────────────────────────────
-
-    def _redraw_puzzle(self) -> None:
-        if not self.puzzle_active:
+    def _place_overlay(self) -> None:
+        """Re-place the existing image without retransmitting bytes (cheap).
+        Throttled so we don't flood the terminal on every claude tick."""
+        if not (self.puzzle_active and self.overlay_supported and self.image_transmitted):
+            return
+        now = time.monotonic()
+        if now - self.last_overlay_t < 0.05:
             return
         out = bytearray()
         out += cursor_save()
-
-        # Top divider.
-        out += goto(self.layout.puzzle_top, 1) + clear_line()
-        out += f"{render.DIM}{'─' * min(self.layout.cols, 80)}{render.RESET}".encode()
-
-        # Header.
-        if self.session is not None:
-            s = self.session
-            you = render.color_name(s.p.user_color)
-            themes = ", ".join(s.p.themes[:3])
-            h1 = (
-                f"{render.BOLD}♟ {s.p.id}{render.RESET}  "
-                f"{render.DIM}{s.p.rating} · {themes} · play {you}{render.RESET}"
-            )
-        else:
-            h1 = f"{render.BOLD}♟ Lichess puzzle{render.RESET}"
-        out += goto(self.layout.puzzle_top + 1, 1) + clear_line() + h1.encode()
-
-        # Body: 8 board rows, or placeholder.
-        if self.session is not None:
-            for i, line in enumerate(self.session.board_lines()):
-                out += goto(self.layout.puzzle_top + 2 + i, 1) + clear_line() + line.encode()
-        else:
-            placeholder = f"{render.DIM}fetching puzzle…{render.RESET}"
-            out += goto(self.layout.puzzle_top + 5, 1) + clear_line() + placeholder.encode()
-            for i in range(8):
-                if i == 3:
-                    continue
-                out += goto(self.layout.puzzle_top + 2 + i, 1) + clear_line()
-
-        # Status line.
-        status = self.banner or self.status_msg
-        if not status and self.session is not None:
-            if self.session.finished and self.session.won:
-                status = f"{render.BOLD}\033[38;5;48m🏆 solved!{render.RESET}"
-            elif self.session.finished:
-                status = f"{render.DIM}puzzle ended.{render.RESET}"
-            else:
-                status = (
-                    f"{render.DIM}type your move into Claude's input and end with "
-                    f"{render.BOLD}%{render.RESET}{render.DIM} (e.g. e2e4%, h%, q%). "
-                    f"Enter sends to Claude as usual.{render.RESET}"
-                )
-        out += goto(self.layout.puzzle_top + 11, 1) + clear_line() + (status or "").encode()
-
-        # Show the snoop buffer so the user can see what we'd submit.
-        if self.snoop_buffer:
-            preview = (
-                f"{render.DIM}buffer: {render.RESET}"
-                f"{render.BOLD}{self.snoop_buffer}{render.RESET}"
-                f"{render.DIM}  (add % to submit){render.RESET}"
-            )
-        else:
-            preview = ""
-        out += goto(self.layout.puzzle_top + 12, 1) + clear_line() + preview.encode()
-
-        # Always restore cursor — the user is interacting with Claude's
-        # input area, the puzzle is read-only display.
+        anchor_row, anchor_col = self.layout.overlay_anchor()
+        out += goto(anchor_row, anchor_col)
+        out += overlay.kitty_place(IMAGE_ID)
         out += cursor_restore()
         write_raw(sys.stdout.fileno(), bytes(out))
+        self.last_overlay_t = now
 
     def _show_move_result(self, r: MoveResult) -> None:
         if r.kind == "ok":
-            parts = [f"\033[32m✓ {r.user_san}{render.RESET}"]
+            parts = [f"✓ {r.user_san}"]
             if r.opponent_san:
-                parts.append(f"{render.DIM}· opp: {r.opponent_san}{render.RESET}")
-            self.status_msg = "  ".join(parts)
+                parts.append(f"opp: {r.opponent_san}")
+            self.status_msg = "  ·  ".join(parts)
         elif r.kind == "wrong":
-            self.status_msg = f"\033[31m✗ {r.message}{render.RESET}"
+            self.status_msg = f"✗ {r.message}"
         elif r.kind == "unparseable":
-            self.status_msg = f"{render.DIM}{r.message}{render.RESET}"
+            self.status_msg = r.message or ""
         elif r.kind == "command":
             self.status_msg = r.message or ""
 
