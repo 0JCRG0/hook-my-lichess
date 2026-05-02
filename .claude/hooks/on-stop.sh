@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
-# Tells the hml wrapper that Claude has finished its turn.
+# Stop hook: tell the daemon Claude is done. Daemon stays alive so the
+# user can keep solving; banner just changes.
 cat >/dev/null
-[[ -n "$HML_SOCKET" && -S "$HML_SOCKET" ]] && \
-  python3 -c 'import socket,sys,os; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(b"IDLE\n", os.environ["HML_SOCKET"])' \
-  >/dev/null 2>&1 || true
+
+if [[ -x "$CLAUDE_PROJECT_DIR/.venv/bin/hml-overlay" ]]; then
+  bin="$CLAUDE_PROJECT_DIR/.venv/bin/hml-overlay"
+elif command -v hml-overlay >/dev/null 2>&1; then
+  bin="hml-overlay"
+else
+  exit 0
+fi
+
+"$bin" idle </dev/null >/dev/null 2>&1 &
 exit 0
+# Note: idle/move/etc. paths only need socket access (no /dev/tty),
+# so stderr can be silenced.

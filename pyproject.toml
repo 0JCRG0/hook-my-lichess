@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-hml = "lichess_puzzle.wrapper:main"
+hml-overlay = "lichess_puzzle.sidecar:main"
 lichess-puzzle = "lichess_puzzle.cli:main"
 
 [build-system]

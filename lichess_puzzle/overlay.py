@@ -390,7 +390,7 @@ def _status_text_and_color(
         return "★ solved!", GREEN
     if session.finished:
         return "puzzle ended.", DIM
-    return "type your move into Claude's input + %  (e.g. e2e4%)", DIM
+    return "type  p:<move>  as your prompt  (e.g. p:e2e4)", DIM
 
 
 def _strip_ansi(s: str) -> str:
@@ -443,15 +443,20 @@ def kitty_transmit(
     image_id: int,
     cells_w: int | None = None,
     cells_h: int | None = None,
+    placement_id: int = 1,
 ) -> bytes:
-    """Transmit + display an image.
+    """Transmit + display an image at a stable placement id.
 
-    Always sets C=1 so the cursor does NOT move after placement (otherwise
-    a too-tall image scrolls the whole terminal). When cells_w / cells_h
-    are passed, kitty scales the image to that exact cell box, which lets
-    us cap the image to the available terminal area.
+    `p={placement_id}` pins the placement so subsequent transmits
+    *replace* it instead of stacking up additional ghost placements
+    (without `p=`, Kitty/Ghostty assign a fresh id each transmit, which
+    leaves the earlier copies lingering on screen). `C=1` so the
+    cursor doesn't move after placement (otherwise a too-tall image
+    scrolls the whole terminal). When cells_w / cells_h are passed,
+    kitty scales the image to that exact cell box, which lets us cap
+    the image to the available terminal area.
     """
-    extras = ",C=1"
+    extras = f",C=1,p={placement_id}"
     if cells_w is not None:
         extras += f",c={cells_w}"
     if cells_h is not None:

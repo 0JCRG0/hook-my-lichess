@@ -10,28 +10,32 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 cp .env.example .env   # then put a Lichess token in LICHESS_TOKEN
 
-# Run the wrapper (the actual product): launches Claude Code under a PTY
-# proxy that floats a Lichess puzzle image over the same terminal while
-# Claude is working.
-.venv/bin/hml claude
+# The product. Two pieces:
+#   1. The hooks in .claude/settings.json wire UserPromptSubmit/Stop
+#      to .claude/hooks/{on-prompt,on-start,on-stop}.sh, which call
+#      `hml-overlay`. Drop those hooks (with absolute paths) into
+#      ~/.claude/settings.json to make the overlay appear in any
+#      project.
+#   2. `claude` itself — run it normally. There is no wrapper binary.
+.venv/bin/claude    # or just `claude` if the venv is activated
 
-# Standalone puzzle TUI — bypasses the wrapper entirely. Useful for
-# exercising engine.py / board.py / api.py / render.py without touching
-# the overlay code path. `python -m lichess_puzzle` is equivalent.
+# Standalone puzzle TUI — no overlay, no Claude. Useful for
+# exercising engine.py / board.py / api.py / render.py.
 .venv/bin/lichess-puzzle
 .venv/bin/lichess-puzzle --no-submit          # don't POST result to Lichess
 .venv/bin/lichess-puzzle --rated              # report as rated (puzzle:write)
 
-# End-to-end smoke test for the wrapper. Spawns `hml bash -i` in a
-# synthetic 40×120 PTY with HML_FORCE_OVERLAY=1 and asserts the v5
-# invariants (no DECSTBM, PTY size unchanged, Kitty a=T/a=p/a=d escapes
-# in the right places, snoop+% intercept, literal-% pass-through).
-.venv/bin/python scripts/smoke_wrapper.py
+# End-to-end smoke test for the sidecar. Spawns `hml-overlay start`
+# inside a synthetic 40×120 PTY with HML_FORCE_OVERLAY=1 and asserts:
+# PID file appears, Kitty a=T/a=p/a=d escapes in the right places,
+# MOVE/IDLE retransmit, no DECSTBM. Returns 0 on success, 2 on a
+# failed assertion.
+.venv/bin/python scripts/smoke_sidecar.py
 ```
 
-There is no test suite, linter, or formatter wired up. `smoke_wrapper.py`
-is the only automated check; it returns exit 0 on success, 2 on a failed
-assertion. Run it after any non-trivial change to `wrapper.py`.
+There is no test suite, linter, or formatter wired up. `smoke_sidecar.py`
+is the only automated check. Run it after any non-trivial change to
+`sidecar.py`.
 
 `HML_FORCE_OVERLAY=1` bypasses the terminal-detection heuristic and
 forces the overlay path on (used by the smoke test, and useful when
@@ -40,13 +44,13 @@ detected).
 
 ## Architecture
 
-Two entry points, one engine, plus an overlay layer.
+One sidecar daemon, one engine, plus a shared overlay layer.
 
 - `lichess_puzzle/engine.py` — `PuzzleSession`, an I/O-agnostic state
   machine that owns the board, current solution index, and `try_move()`
   semantics (UCI/SAN parsing via `python-chess`, hint/solve/quit
   commands, auto-playing the opponent's reply on a correct move). Both
-  the standalone CLI and the wrapper drive it. `_parse()` tries SAN
+  the standalone CLI and the sidecar drive it. `_parse()` tries SAN
   first, then falls back to UCI; UCI input is `.lower()`'d before
   parsing but SAN is not, so `nf3` fails while `Nf3` and `g1f3` both
   work.
@@ -66,7 +70,7 @@ Two entry points, one engine, plus an overlay layer.
   helpers. Owns `OverlaySpec` (all dimensions live there;
   `from_scale()` produces a scaled spec from `settings.size`),
   `is_supported()` (capability sniff), and `kitty_transmit` /
-  `kitty_place` / `kitty_delete` (the three Kitty escapes the wrapper
+  `kitty_place` / `kitty_delete` (the three Kitty escapes the sidecar
   sends).
 - `lichess_puzzle/settings.py` — Pydantic v2 settings loader. Looks at
   `$HML_CONFIG`, then `<cwd>/hml.json`, then
@@ -76,89 +80,78 @@ Two entry points, one engine, plus an overlay layer.
   or a `[row, col]` tuple (1-indexed cells). Invalid configs print a
   warning and fall back to defaults. `settings.example.json` at the
   repo root is a working sample.
-- `lichess_puzzle/wrapper.py` — the `hml` PTY proxy. **This is where
-  the interesting/fragile design lives.**
+- `lichess_puzzle/sidecar.py` — the `hml-overlay` daemon. **This is
+  where the lifecycle/IPC design lives.**
 
-### How the wrapper overlays a puzzle on Claude's TUI (v5)
+### How the sidecar overlays a puzzle on Claude's TUI (v6)
 
-This is the thing to understand before editing `wrapper.py`:
+This is the thing to understand before editing `sidecar.py`:
 
-1. `hml claude` calls `pty.fork()` and execs the child argv inside a
-   PTY. The parent puts stdin into raw mode and forwards bytes both
-   directions. **The child PTY is always sized to the full terminal**
-   — Claude is never resized, and never sees the image.
-2. The wrapper binds a Unix datagram socket at `/tmp/hml-<pid>.sock`
-   and exports its path as `$HML_SOCKET`. The hook scripts in
-   `.claude/hooks/` send a one-line `WORKING\n` (on `UserPromptSubmit`)
-   or `IDLE\n` (on `Stop`) datagram to that socket; the wrapper
-   reacts in `_on_event()`. Hooks are silent no-ops when `HML_SOCKET`
-   is unset — that's how they distinguish "running under `hml`" from
-   "running under plain `claude`". If you change the socket protocol,
-   update both `on-start.sh` and `on-stop.sh`.
-3. **Layout strategy is "Kitty graphics overlay, never resize."** The
-   puzzle is rendered to a PNG and floated above the text grid via the
-   Kitty graphics protocol (works in Ghostty / Kitty / WezTerm,
-   detected by `overlay.is_supported()`; on other terminals the
-   overlay path is skipped entirely and the wrapper proxies Claude
-   transparently). Earlier designs used `DECSTBM` scroll regions or
-   PTY shrinks; both were brittle. **Don't reintroduce DECSTBM** —
-   `smoke_wrapper.py` explicitly asserts no `ESC[1;Nr` is emitted, and
-   that the child PTY's `$LINES` is unchanged across `WORKING`.
-4. **Image lifecycle.** The image uses a fixed `IMAGE_ID = 1729` and
-   placement id 1.
-   - On `WORKING`: render PNG, transmit with `a=T,C=1,c=…,r=…` (`C=1`
-     so the cursor doesn't move and the image doesn't scroll the
-     screen; `c`/`r` cap the image to the available cell box).
-   - On every byte from Claude (`_handle_master`) and on each event
-     loop tick while a puzzle is active: re-place the existing image
-     so it stays on top of scrolls. Re-place is throttled to ~60 Hz
-     (`0.016 s`).
-   - **Always delete the placement before re-placing it.** Both
-     `_update_overlay` and `_place_overlay` emit `kitty_delete_placement`
-     (`a=d,d=i`) before the new `a=p`/`a=T`. Relying on "same
-     placement_id replaces the old one" semantics is unreliable across
-     Kitty/Ghostty/WezTerm versions and leaves ghost copies of the
-     image in the scrollback when Claude's output scrolls. The
-     delete-then-place pattern is what kills those ghosts. There are
-     two delete helpers in `overlay.py` — `kitty_delete_placement`
-     (`d=i`, drops one placement, keeps image bytes cached) and
-     `kitty_delete` (`d=I`, drops the image and all placements); use
-     the placement variant on every re-place, and the full variant
-     only on puzzle finish / wrapper exit.
+1. Claude Code owns its terminal end-to-end — there is **no PTY proxy**.
+   The sidecar is a sibling process that opens the controlling tty for
+   writes and emits Kitty graphics escapes. We never see or buffer
+   Claude's I/O.
+2. **Lifecycle.** `hml-overlay start` (UserPromptSubmit hook) captures
+   `os.ttyname(0)` *before* daemonizing, double-forks, redirects
+   stdin/stdout/stderr to /dev/null, and re-opens the saved tty path
+   (NOT `/dev/tty` — after `setsid()` we have no controlling terminal).
+   The daemon writes a per-tty PID file to `~/.cache/hml/overlay-<key>.pid`
+   and binds a per-tty Unix datagram socket at
+   `/tmp/hml-overlay-<key>.sock` (key = sha1 of tty name, first 12 hex
+   chars). One daemon per controlling terminal so two Claudes in two
+   panes coexist. `start` is idempotent — if a daemon is already alive
+   it just sends `WORKING` over the socket and exits.
+3. **Redraw cadence.** The daemon's main loop sits on a `selectors`
+   poll with a 16 ms (~60 Hz) timeout. Every tick it re-emits
+   `kitty_place(IMAGE_ID=1729, placement_id=1)` to the tty, wrapped in
+   `ESC 7` / `ESC 8` (cursor save/restore) and a cursor `goto` to the
+   anchor. Kitty docs guarantee that an `a=p` with the same `(i, p)`
+   replaces the previous placement without flicker, so we don't need a
+   delete-then-place dance for re-anchors.
+4. **Image lifecycle.**
+   - On daemon start: emit a "fetching…" frame, kick off the API
+     fetch in a background thread, then transmit again with the
+     parsed puzzle (`a=T,C=1,c=…,r=…`). `C=1` so the cursor doesn't
+     move; `c`/`r` clamp the image to the available cell box.
+   - Every 16 ms tick: re-place the existing image so it snaps back
+     above scrolls.
    - On `IDLE`: regenerate the image with the "✓ Claude is done"
-     banner.
-   - On puzzle finish / wrapper exit: delete the image with
-     `kitty_delete` (`a=d,d=I`).
-   - Cursor is always saved (`ESC 7`) before any overlay write and
-     restored (`ESC 8`) after, so Claude's TUI cursor isn't disturbed.
-   - The main loop's `select` timeout is 50 ms while a puzzle is up
-     (so re-place keeps firing even when Claude is silent right after
-     a scroll completes) and 0.5 s otherwise.
-5. **Snoop-and-`%` input model.** When a puzzle is active, every
-   stdin byte is *forwarded to Claude as normal* and *also fed into
-   `snoop_buffer`*. The buffer is reset on Enter / ESC / Ctrl-C; only
-   printable ASCII is appended; `0x7f`/`0x08` pop the last char. When
-   the byte is `%` and the current buffer matches a chess move
-   (`MOVE_RE = [a-h1-8RNBQKO=+#xX\-O0]{2,}`, length ≥ 3) or a command
-   token (`h, hint, ?, s, solve, q, quit`), the wrapper:
-     - drops the `%` (does **not** forward it),
-     - sends `len(buffer)` `BACKSPACE` (`0x7f`) bytes back to the child
-       so Claude wipes the move characters from its input box,
-     - feeds the buffer to `PuzzleSession.try_move`,
-     - and updates the overlay.
-   Anything that doesn't match (e.g. typing `wait 30%`) passes through
-   untouched, including the literal `%`. Pressing Enter still submits
-   the line to Claude as normal.
-6. **Puzzle fetch is async** (`threading.Thread` → `queue.Queue`) so
-   the event loop stays responsive; results are picked up in
-   `_drain_fetch_queue` on each `select` tick.
-7. **On terminal resize** (`SIGWINCH`): refresh layout, re-pass the
-   full size to the child PTY (Claude redraws), and re-place the
-   image at the new anchor.
+     banner. The daemon does NOT exit; the user keeps solving.
+   - On `WORKING` while a celebration is in progress (puzzle just
+     solved): cancel the celebration timer, fetch a new puzzle, redraw.
+   - On `MOVE <text>` / `HINT` / `SOLVE` / `QUIT`: drive
+     `PuzzleSession`, regenerate, retransmit.
+   - On puzzle finish (lost, gave up, or celebration timer expired):
+     delete the image with `kitty_delete` (`a=d,d=I`) and exit.
+   - On SIGTERM/SIGINT/SIGHUP or tty going away (`os.write` ENXIO/EIO):
+     same delete + clean exit.
+   - **Don't reintroduce DECSTBM** — `smoke_sidecar.py` asserts no
+     `ESC[1;Nr` is emitted. Earlier designs used scroll regions or
+     PTY shrinks; both were brittle.
+5. **Move-input UX is a slash-command interception.**
+   `.claude/hooks/on-prompt.sh` (a UserPromptSubmit hook ordered
+   *before* `on-start.sh`) reads the JSON event, extracts the prompt,
+   and matches against:
+     - `^/p[[:space:]]+(.+)$` → forward to `hml-overlay move <text>`
+     - `^/(hint|solve|quit)$` → forward to `hml-overlay <cmd>`
+   On a match it prints `{"decision":"block","reason":"…"}` and
+   exits 0, suppressing the prompt before Claude sees it. Anything
+   else passes through untouched (including prompts that contain
+   `%` — no false-positive interception).
+6. **Puzzle fetch is async** (`threading.Thread` → `queue.Queue`)
+   so the redraw timer stays smooth.
+7. **On terminal resize** (`SIGWINCH`): refresh layout, rebuild the
+   spec at the new size, and retransmit.
 
 ### Hook integration
 
-`.claude/settings.json` wires the two hook scripts using
-`$CLAUDE_PROJECT_DIR`. To make the overlay appear in *any* project,
-copy the `hooks` block to `~/.claude/settings.json` with absolute
-paths to the hook scripts in this repo.
+`.claude/settings.json` wires three hook scripts using
+`$CLAUDE_PROJECT_DIR`. The `UserPromptSubmit` block runs `on-prompt.sh`
+*then* `on-start.sh` — the first intercepts puzzle slash commands,
+the second nudges/spawns the daemon (always; the prompt hook's
+`block` decision only suppresses the prompt, not subsequent hooks).
+The `Stop` block runs `on-stop.sh`, which sends `IDLE`.
+
+To make the overlay appear in *any* project, copy the `hooks` block
+to `~/.claude/settings.json` with absolute paths to the hook scripts
+in this repo.
