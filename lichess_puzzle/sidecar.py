@@ -525,7 +525,7 @@ class Daemon:
         def _set_exit(*_):
             self.should_exit = True
         # SIGTERM is the *deliberate* kill signal — only `hml-overlay
-        # stop`, our smoke test, and explicit `pkill` send it.
+        # stop` and explicit `pkill` send it.
         signal.signal(signal.SIGTERM, _set_exit)
         # SIGINT and SIGHUP can leak to us from Claude Code's process
         # group (we don't setsid so we can keep `/dev/tty` writable).
@@ -670,6 +670,26 @@ def _dbg(msg: str) -> None:
             pass
 
 
+def cmd_init_config() -> int:
+    from pathlib import Path
+
+    target = Path.home() / ".config" / "hml" / "settings.json"
+    if target.exists():
+        print(f"hml: settings already exist at {target}", file=sys.stderr)
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        '{\n'
+        '  "size": "medium",\n'
+        '  "position": "top-right"\n'
+        '}\n'
+    )
+    print(f"hml: wrote default settings to {target}")
+    print('hml: size = "small"|"medium"|"large"|"xl"|"xxl" or any positive number')
+    print('hml: position = "top-right"|"top-left"|"bottom-right"|"bottom-left"|"center" or [row, col]')
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _dbg(f"main argv={argv}")
     parser = argparse.ArgumentParser(prog="hml-overlay", description=__doc__.splitlines()[0])
@@ -680,6 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("hint")
     sub.add_parser("solve")
     sub.add_parser("quit")
+    sub.add_parser("init-config", help="write a default settings file to ~/.config/hml/settings.json")
     p_move = sub.add_parser("move")
     p_move.add_argument("text", nargs="+")
     args = parser.parse_args(argv)
@@ -696,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_send("SOLVE")
     if args.cmd == "move":
         return cmd_send("MOVE " + " ".join(args.text))
+    if args.cmd == "init-config":
+        return cmd_init_config()
     return 0
 
 

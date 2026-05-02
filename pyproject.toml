@@ -2,7 +2,25 @@
 name = "hook-my-lichess"
 version = "0.1.0"
 description = "A Claude Code hook that opens a Lichess puzzle in your terminal while Claude is working."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "JCRG" }]
 requires-python = ">=3.10"
+keywords = ["lichess", "chess", "puzzle", "claude-code", "kitty-graphics", "terminal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment :: Board Games",
+    "Topic :: Terminals",
+]
 dependencies = [
     "chess>=1.10",
     "httpx>=0.27",
@@ -10,6 +28,11 @@ dependencies = [
     "Pillow>=10.0",
     "pydantic>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/0JCRG0/hook-my-lichess"
+Repository = "https://github.com/0JCRG0/hook-my-lichess"
+Issues = "https://github.com/0JCRG0/hook-my-lichess/issues"
 
 [project.scripts]
 hml-overlay = "lichess_puzzle.sidecar:main"

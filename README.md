@@ -33,30 +33,35 @@ overlay lives in a sibling process:
 See `docs/v5-wrapper-vs-v6-sidecar.md` for the full architecture
 comparison and the bugs that drove the rewrite.
 
-## Setup
+## Install
+
+`hook-my-lichess` is distributed as a Claude Code plugin. Two slash
+commands and you're done.
+
+**Prereqs (one-time):**
 
 ```bash
-cd /Users/juanreyesgarcia/Dev/hook-my-lichess
-python3 -m venv .venv
-.venv/bin/pip install -e .
-cp .env.example .env
-# put your Lichess personal token in .env
+# uv runs the Python daemon on demand and caches it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Lichess personal token, see https://lichess.org/account/oauth/token
+export LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxx   # add to your shell rc
 ```
 
-## Run it
+**Install in Claude Code:**
 
-Just run Claude Code as you normally would. There is **no wrapper
-binary**.
-
-```bash
-.venv/bin/claude   # or just `claude` if the venv is activated
+```
+/plugin marketplace add 0JCRG0/hook-my-lichess
+/plugin install hook-my-lichess@hml
 ```
 
-The hooks in this project's `.claude/settings.json` spawn the
-overlay daemon on every prompt submission. The daemon auto-detects
-whether the terminal supports Kitty graphics (Ghostty / Kitty /
-WezTerm); on terminals that don't (iTerm2, Terminal.app, tmux), it
-exits silently — Claude works as normal.
+That's it. The next prompt you submit will fire the hooks; `uvx`
+fetches `hook-my-lichess` from PyPI on first run (~2 s) and caches
+it. Subsequent invocations are instant.
+
+The daemon auto-detects whether the terminal supports Kitty graphics
+(Ghostty / Kitty / WezTerm); on terminals that don't (iTerm2,
+Terminal.app, tmux), it exits silently — Claude works as normal.
 
 ## Playing the puzzle
 
@@ -81,16 +86,16 @@ through to Claude untouched.)
 When Claude finishes its turn, the banner flips to "✓ Claude is done"
 and you can keep solving at your own pace.
 
-## Customizing
+## Customizing the board (size & position)
 
-Drop a `settings.json` to tune size and position. The daemon looks
-at (priority order):
+Generate a default settings file:
 
-1. `$HML_CONFIG` (if set)
-2. `<cwd>/hml.json`
-3. `~/.config/hml/settings.json`
+```bash
+uvx --from hook-my-lichess hml-overlay init-config
+# wrote default settings to ~/.config/hml/settings.json
+```
 
-Schema (Pydantic v2):
+Edit `~/.config/hml/settings.json`:
 
 ```json
 {
@@ -102,20 +107,29 @@ Schema (Pydantic v2):
 - **`size`** — one of `"small"` (0.75×), `"medium"` (1×, default), `"large"` (1.25×), `"xl"` (1.5×), `"xxl"` (2×), or any positive number for an exact scale (e.g. `"size": 1.7`).
 - **`position`** — one of `"top-right"` (default), `"top-left"`, `"bottom-right"`, `"bottom-left"`, `"center"`, or a `[row, col]` pair for an exact 1-indexed cell (e.g. `"position": [3, 80]`).
 
-Sample at `settings.example.json`. Copy to `~/.config/hml/settings.json`
-to apply it everywhere.
+The daemon checks three locations in order: `$HML_CONFIG`, then
+`<cwd>/hml.json`, then `~/.config/hml/settings.json`. The per-user
+file is the one you usually want.
 
-## Going global
+## Developing locally
 
-Hooks live in this project's `.claude/settings.json` and reference
-`$CLAUDE_PROJECT_DIR/.venv/bin/hml-overlay`. To make the overlay
-appear in any project:
+If you want to hack on the overlay itself instead of just using it:
 
-1. Make sure `hml-overlay` is on your `$PATH` (e.g. symlink
-   `.venv/bin/hml-overlay` into `~/.local/bin`).
-2. Copy the `hooks` block from this repo's
-   `.claude/settings.json` to `~/.claude/settings.json` with
-   absolute paths to the hook scripts.
+```bash
+git clone https://github.com/0JCRG0/hook-my-lichess
+cd hook-my-lichess
+python3 -m venv .venv
+.venv/bin/pip install -e .
+cp .env.example .env   # put LICHESS_TOKEN here
+```
+
+The hooks in this repo's `.claude/settings.json` reference
+`$CLAUDE_PROJECT_DIR/hooks/*.sh`, and those scripts prefer the local
+`.venv/bin/hml-overlay` over `uvx` when present — so working inside
+this repo always uses your in-tree code, no rebuild needed.
+
+If you also have the marketplace plugin installed, disable it for
+this repo (`/plugin disable hook-my-lichess`) so hooks don't double-fire.
 
 ## Force-enable the overlay (debugging)
 
@@ -134,14 +148,3 @@ Same engine, plain stdin loop:
 
 Useful for exercising `engine.py`, `board.py`, `api.py`, `render.py`
 without touching the overlay code path.
-
-## Smoke test
-
-```bash
-.venv/bin/python scripts/smoke_sidecar.py
-```
-
-Spawns `hml-overlay start` in a synthetic 40×120 PTY with
-`HML_FORCE_OVERLAY=1` and asserts: PID file appears, Kitty `a=T` /
-`a=p` / `a=d` escapes in the right places, MOVE/IDLE retransmit, no
-DECSTBM. Returns 0 on success, 2 on a failed assertion.
