@@ -24,23 +24,15 @@ cp .env.example .env   # then put a Lichess token in LICHESS_TOKEN
 .venv/bin/lichess-puzzle
 .venv/bin/lichess-puzzle --no-submit          # don't POST result to Lichess
 .venv/bin/lichess-puzzle --rated              # report as rated (puzzle:write)
-
-# End-to-end smoke test for the sidecar. Spawns `hml-overlay start`
-# inside a synthetic 40×120 PTY with HML_FORCE_OVERLAY=1 and asserts:
-# PID file appears, Kitty a=T/a=p/a=d escapes in the right places,
-# MOVE/IDLE retransmit, no DECSTBM. Returns 0 on success, 2 on a
-# failed assertion.
-.venv/bin/python scripts/smoke_sidecar.py
 ```
 
-There is no test suite, linter, or formatter wired up. `smoke_sidecar.py`
-is the only automated check. Run it after any non-trivial change to
-`sidecar.py`.
+There is no test suite, linter, or formatter wired up. The only
+verification path is manual: install/enable the plugin, submit a
+prompt in Claude Code, and confirm the puzzle appears.
 
 `HML_FORCE_OVERLAY=1` bypasses the terminal-detection heuristic and
-forces the overlay path on (used by the smoke test, and useful when
-debugging on terminals that should support Kitty graphics but aren't
-detected).
+forces the overlay path on (useful when debugging on terminals that
+should support Kitty graphics but aren't detected).
 
 ## Architecture
 
@@ -125,9 +117,8 @@ This is the thing to understand before editing `sidecar.py`:
      delete the image with `kitty_delete` (`a=d,d=I`) and exit.
    - On SIGTERM/SIGINT/SIGHUP or tty going away (`os.write` ENXIO/EIO):
      same delete + clean exit.
-   - **Don't reintroduce DECSTBM** — `smoke_sidecar.py` asserts no
-     `ESC[1;Nr` is emitted. Earlier designs used scroll regions or
-     PTY shrinks; both were brittle.
+   - **Don't reintroduce DECSTBM** (`ESC[1;Nr`). Earlier designs used
+     scroll regions or PTY shrinks; both were brittle.
 5. **Move-input UX is a slash-command interception.**
    `.claude/hooks/on-prompt.sh` (a UserPromptSubmit hook ordered
    *before* `on-start.sh`) reads the JSON event, extracts the prompt,

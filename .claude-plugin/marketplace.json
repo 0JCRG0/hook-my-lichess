@@ -1,0 +1,21 @@
+{
+  "name": "hml",
+  "owner": {
+    "name": "0JCRG0",
+    "url": "https://github.com/0JCRG0"
+  },
+  "plugins": [
+    {
+      "name": "hook-my-lichess",
+      "source": ".",
+      "description": "Lichess puzzle overlay that appears in your terminal while Claude is working.",
+      "version": "0.1.0",
+      "author": {
+        "name": "0JCRG0"
+      },
+      "homepage": "https://github.com/0JCRG0/hook-my-lichess",
+      "license": "MIT",
+      "keywords": ["lichess", "chess", "puzzle", "overlay", "kitty-graphics"]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "hook-my-lichess",
+  "version": "0.1.0",
+  "description": "Lichess puzzle overlay that appears in your terminal while Claude is working.",
+  "author": {
+    "name": "0JCRG0"
+  },
+  "homepage": "https://github.com/0JCRG0/hook-my-lichess",
+  "repository": "https://github.com/0JCRG0/hook-my-lichess",
+  "license": "MIT",
+  "keywords": ["lichess", "chess", "puzzle", "overlay", "kitty-graphics"]
+}
