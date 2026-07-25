@@ -12,7 +12,7 @@ Lifecycle:
   - `hml-overlay move <text>` / `hint` / `solve` / `quit` — single
     commands sent over the daemon's Unix datagram socket.
 
-One daemon per controlling terminal (keyed by sha1 of `os.ttyname`),
+One daemon per terminal (keyed by the pty device name),
 so two Claude sessions in two panes each get their own overlay.
 
 Why a sidecar (vs. the previous PTY-proxy wrapper):
@@ -32,6 +32,7 @@ import queue
 import selectors
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -50,15 +51,13 @@ ESC = "\x1b"
 # ── Per-tty paths ─────────────────────────────────────────────────────────
 
 
-def _session_key() -> str:
-    """Per-session key from `os.getsid(0)`. Two Claudes in two
-    terminals have different sessions (different shells = different
-    session leaders); two consecutive Claudes in the *same* shell
-    share the key, which is fine — the daemon is idempotent.
-
-    Must be captured BEFORE the daemon's setsid() — once we're a new
-    session leader our SID changes."""
-    return f"{os.getsid(0):x}"
+def _session_key(tty_path: str) -> str:
+    """Per-terminal key from the pty device name (e.g. `ttys003`).
+    Two Claudes in two terminals sit on different ptys, so each gets
+    its own daemon; every hook invocation in the same terminal maps to
+    the same key. getsid() can't be the key: Claude Code detaches each
+    hook child into a fresh session, so the SID differs per prompt."""
+    return Path(tty_path).name.replace("/", "-")
 
 
 def _pid_file(key: str) -> Path:
@@ -74,12 +73,54 @@ def _socket_path(key: str) -> Path:
 # ── tty / process helpers ─────────────────────────────────────────────────
 
 
-def _open_controlling_tty() -> int | None:
-    """Open /dev/tty — the magic device that resolves to the calling
-    process's controlling terminal. Returns None if the process has
-    no controlling terminal."""
+def _find_tty_path() -> str | None:
+    """Resolve the pty device of the terminal this process ultimately
+    runs in. `/dev/tty` only works when we have a controlling terminal
+    (direct shell runs); Claude Code detaches hook children from the
+    tty entirely, so fall back to walking the parent chain until we
+    hit the process that still owns one (Claude Code itself).
+
+    The hook scripts pre-resolve the tty and pass it via HML_TTY —
+    that takes priority, because a daemon backgrounded by a hook is
+    reparented to launchd before it could walk the tree itself."""
+    env_tty = os.environ.get("HML_TTY", "").strip()
+    if env_tty and os.path.exists(env_tty):
+        return env_tty
     try:
-        return os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+        try:
+            return os.ttyname(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    pid = os.getpid()
+    for _ in range(32):
+        try:
+            fields = subprocess.run(
+                ["ps", "-o", "ppid=,tty=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if len(fields) < 2:
+            return None
+        ppid_s, tty = fields[0], fields[1]
+        if tty not in ("??", "-", ""):
+            return f"/dev/{tty}"
+        try:
+            ppid = int(ppid_s)
+        except ValueError:
+            return None
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def _open_tty(tty_path: str) -> int | None:
+    try:
+        return os.open(tty_path, os.O_WRONLY | os.O_NOCTTY)
     except OSError:
         return None
 
@@ -612,14 +653,20 @@ def _existing_daemon_pid(pid_file: Path) -> int | None:
 
 def cmd_start() -> int:
     if not overlay.is_supported():
+        _dbg("cmd_start: overlay not supported (no Kitty-graphics env markers)")
         return 0
-    tty_fd = _open_controlling_tty()
+    tty_path = _find_tty_path()
+    if tty_path is None:
+        _dbg("cmd_start: no tty found (direct or via ancestor walk)")
+        return 0
+    tty_fd = _open_tty(tty_path)
     if tty_fd is None:
+        _dbg(f"cmd_start: cannot open {tty_path}")
         return 0
-    key = _session_key()
+    key = _session_key(tty_path)
     pid_file = _pid_file(key)
     sock_path = _socket_path(key)
-    _dbg(f"cmd_start: key={key} sid={os.getsid(0)}")
+    _dbg(f"cmd_start: key={key} tty={tty_path}")
 
     if _existing_daemon_pid(pid_file) is not None:
         os.close(tty_fd)
@@ -655,8 +702,11 @@ def cmd_start() -> int:
 
 
 def cmd_send(msg: str) -> int:
-    key = _session_key()
-    sock_path = _socket_path(key)
+    tty_path = _find_tty_path()
+    if tty_path is None:
+        _dbg(f"cmd_send: no tty found, dropping {msg!r}")
+        return 0
+    sock_path = _socket_path(_session_key(tty_path))
     _send(sock_path, msg)
     return 0
 

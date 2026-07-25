@@ -3,7 +3,10 @@
 # user can keep solving; banner just changes.
 cat >/dev/null
 
-runner=$("$(dirname -- "${BASH_SOURCE[0]}")/_resolve.sh")
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "${script_dir}/_tty.sh"
+
+runner=$("${script_dir}/_resolve.sh")
 [[ -z "$runner" ]] && exit 0
 
 eval "$runner" idle </dev/null >/dev/null 2>&1 &

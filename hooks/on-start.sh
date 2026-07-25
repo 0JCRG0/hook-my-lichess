@@ -4,7 +4,10 @@
 # terminal doesn't support Kitty graphics.
 input=$(cat)
 
-runner=$("$(dirname -- "${BASH_SOURCE[0]}")/_resolve.sh")
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "${script_dir}/_tty.sh"
+
+runner=$("${script_dir}/_resolve.sh")
 [[ -z "$runner" ]] && exit 0
 
 # Pull the transcript path out of the event JSON and pass it to the
