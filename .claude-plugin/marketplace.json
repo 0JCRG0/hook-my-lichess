@@ -9,7 +9,7 @@
       "name": "hook-my-lichess",
       "source": ".",
       "description": "Lichess puzzle overlay that appears in your terminal while Claude is working.",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "author": {
         "name": "0JCRG0"
       },

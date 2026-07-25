@@ -57,6 +57,7 @@ class OverlaySpec:
     ui_pt: int = 26
     ui_small_pt: int = 20
     label_pt: int = 22
+    legend_w: int = 236
 
     @classmethod
     def from_scale(cls, scale: float) -> "OverlaySpec":
@@ -72,7 +73,7 @@ class OverlaySpec:
 
     @property
     def img_w(self) -> int:
-        return self.label_gutter + self.board_px + 2 * self.padding
+        return self.label_gutter + self.board_px + 2 * self.padding + self.legend_w
 
     @property
     def img_h(self) -> int:
@@ -239,6 +240,7 @@ def render_png(
             msg, fill=FG, font=fonts.ui,
         )
     _draw_grid_labels(d, board_origin, perspective, fonts, spec)
+    _draw_legend(d, fonts, spec)
 
     # Status / banner share one area.
     status_origin_y = spec.header_h + spec.board_px + spec.label_gutter + spec.padding
@@ -369,6 +371,34 @@ def _draw_piece(
              sy + (spec.square_px - h) / 2 - bbox[1]),
             letter, font=fonts.piece, fill=fill,
         )
+
+
+def _draw_legend(
+    d: ImageDraw.ImageDraw,
+    fonts: _Fonts,
+    spec: OverlaySpec,
+) -> None:
+    """Command cheat-sheet in the column right of the board, so players
+    don't need to remember the p: syntax."""
+    rows = [
+        ("p:e2e4", "move (UCI)"),
+        ("p:Nf3", "move (SAN)"),
+        ("p:hint", "hint"),
+        ("p:solve", "reveal"),
+        ("p:quit", "close"),
+    ]
+    x = spec.label_gutter + spec.board_px + 2 * spec.padding
+    y = spec.header_h + spec.padding
+    line_h = int(round(spec.ui_small_pt * 1.55))
+    d.text((x, y), "commands", fill=DIM, font=fonts.ui_small)
+    y += int(round(line_h * 1.3))
+    col = max(
+        d.textbbox((0, 0), cmd, font=fonts.ui_small)[2] for cmd, _ in rows
+    ) + spec.padding
+    for cmd, desc in rows:
+        d.text((x, y), cmd, fill=FG, font=fonts.ui_small)
+        d.text((x + col, y), desc, fill=DIM, font=fonts.ui_small)
+        y += line_h
 
 
 def _status_text_and_color(
