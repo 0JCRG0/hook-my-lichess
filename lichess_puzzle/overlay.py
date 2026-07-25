@@ -386,8 +386,12 @@ def _draw_legend(
         ("p:hint", "hint"),
         ("p:solve", "reveal"),
         ("p:quit", "close"),
-        ("p:size xl", "resize"),
-        ("p:pos center", "move box"),
+    ]
+    # Config commands with every valid option spelled out — presets that
+    # aren't listed here (e.g. "left") don't exist, and players guess.
+    config = [
+        ("p:size", "small · medium · large · xl · xxl · or a number (1.7)"),
+        ("p:pos", "top-right · top-left · bottom-right · bottom-left · center · or row col (3 80)"),
     ]
     x = spec.label_gutter + spec.board_px + 2 * spec.padding
     y = spec.header_h + spec.padding
@@ -401,6 +405,18 @@ def _draw_legend(
         d.text((x, y), cmd, fill=FG, font=fonts.ui_small)
         d.text((x + col, y), desc, fill=DIM, font=fonts.ui_small)
         y += line_h
+    indent = int(round(spec.ui_small_pt * 0.7))
+    for cmd, opts in config:
+        y += int(round(line_h * 0.35))
+        d.text((x, y), cmd, fill=FG, font=fonts.ui_small)
+        y += line_h
+        n = _wrap_text(
+            d, opts, (x + indent, y),
+            max_width=spec.legend_w - spec.padding - indent,
+            font=fonts.ui_small, fill=DIM,
+            line_height=line_h, max_lines=4,
+        )
+        y += n * line_h
 
 
 def _status_text_and_color(
@@ -445,9 +461,10 @@ def _wrap_text(
     font: ImageFont.ImageFont,
     fill,
     line_height: int,
-) -> None:
+    max_lines: int = 3,
+) -> int:
     if not text:
-        return
+        return 0
     words = text.split(" ")
     lines: list[str] = []
     current = ""
@@ -462,9 +479,11 @@ def _wrap_text(
     if current:
         lines.append(current)
     x, y = origin
-    for line in lines[:3]:
+    drawn = lines[:max_lines]
+    for line in drawn:
         d.text((x, y), line, font=font, fill=fill)
         y += line_height
+    return len(drawn)
 
 
 # ── Kitty graphics protocol ───────────────────────────────────────────────
