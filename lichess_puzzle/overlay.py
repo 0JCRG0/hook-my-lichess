@@ -376,14 +376,21 @@ def _status_text_and_color(
     status_msg: str,
     banner: str,
 ) -> tuple[str, tuple[int, int, int]]:
-    if banner:
-        return banner.lstrip("✓ "), GREEN
+    # Move feedback (status_msg) outranks the Claude-state banner: while
+    # idle the banner is always set, and it used to eat the ✓/✗ result of
+    # every move submitted between turns. When both exist, show both.
     if status_msg:
         if status_msg.startswith("\033[31m") or "not the puzzle move" in status_msg:
-            return _strip_ansi(status_msg), RED
-        if status_msg.startswith("\033[32m") or "✓ " in status_msg:
-            return _strip_ansi(status_msg), GREEN
-        return _strip_ansi(status_msg), FG
+            text, color = _strip_ansi(status_msg), RED
+        elif status_msg.startswith("\033[32m") or "✓ " in status_msg:
+            text, color = _strip_ansi(status_msg), GREEN
+        else:
+            text, color = _strip_ansi(status_msg), FG
+        if banner:
+            text = f"{text}   ·   {banner.lstrip('✓ ')}"
+        return text, color
+    if banner:
+        return banner.lstrip("✓ "), GREEN
     if session is None:
         return "loading…", DIM
     if session.finished and session.won:

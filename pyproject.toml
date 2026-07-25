@@ -1,6 +1,6 @@
 [project]
 name = "hook-my-lichess"
-version = "0.1.4"
+version = "0.1.5"
 description = "A Claude Code hook that opens a Lichess puzzle in your terminal while Claude is working."
 readme = "README.md"
 license = { text = "MIT" }
