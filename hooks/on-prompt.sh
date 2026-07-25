@@ -40,4 +40,22 @@ if [[ "$trimmed" =~ ^p:(.+)$ ]]; then
   exit 0
 fi
 
+# Normal prompt. Messages typed while Claude is mid-turn never pass
+# through this hook — they land in the model's context as plain text,
+# while the daemon's transcript tailer dispatches them to the board.
+# For UserPromptSubmit, plain stdout on exit 0 is injected as context,
+# so teach the model to ignore those leaked commands instead of
+# reacting to them (or worse, re-running them, which would
+# double-dispatch outside the dedup window).
+_hml_supported() {
+  [[ -n "${HML_FORCE_OVERLAY:-}" || -n "${KITTY_WINDOW_ID:-}" ]] && return 0
+  case "$(printf '%s' "${TERM_PROGRAM:-}" | tr '[:upper:]' '[:lower:]')" in
+    ghostty|wezterm|kitty) return 0 ;;
+  esac
+  [[ "${TERM:-}" == *kitty* ]]
+}
+if [[ -n "$runner" ]] && _hml_supported; then
+  printf '%s' "hook-my-lichess: a chess-puzzle overlay is active in this terminal. If a user message consists only of p:<something> (e.g. p:e2e4, p:hint, p:solve, p:quit), it is a puzzle command already executed by a background daemon — do not act on it, do not run any command for it, and do not mention it; continue your current task as if the message had not arrived."
+fi
+
 exit 0
