@@ -218,6 +218,7 @@ class Daemon:
         self.claude_idle: bool = False
         self.closing_at: float | None = None
         self._closing_total: float = 3.0
+        self._giveup_closing_total: float = 5.0
         self.should_exit: bool = False
         self._fetch_q: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
@@ -392,10 +393,12 @@ class Daemon:
             if s.won:
                 self.closing_at = time.monotonic() + self._closing_total
                 self.status_msg = ""
-                self._update_celebration_banner()
-                self._update_overlay()
             else:
-                self._finish_puzzle()
+                # Gave up (p:solve): keep the revealed solution on screen
+                # long enough to actually read it before self-destructing.
+                self.closing_at = time.monotonic() + self._giveup_closing_total
+            self._update_celebration_banner()
+            self._update_overlay()
         else:
             self._update_overlay()
 
@@ -415,7 +418,12 @@ class Daemon:
             return
         remaining = max(0.0, self.closing_at - time.monotonic())
         secs = max(1, int(round(remaining))) if remaining > 0 else 0
-        if self.claude_idle:
+        s = self.session
+        if s is not None and s.finished and not s.won:
+            # status_msg still shows "solution was: <SAN>"; it outranks
+            # the banner in the render slot, so this gets appended.
+            self.banner = f"auto-destruct in {secs}…"
+        elif self.claude_idle:
             self.banner = f"★ Solved!  ·  auto-destruct in {secs}…"
         else:
             self.banner = (
