@@ -35,8 +35,10 @@ commands **as prompts**:
 | `p:e2e4` | UCI move |
 | `p:Nf3` | SAN move (piece letters uppercase) |
 | `p:hint` | which square the piece moves from |
-| `p:solve` | give up, reveal the move |
+| `p:solve` | give up, reveal the move (shown 10 s) |
 | `p:quit` | close the puzzle |
+| `p:size xl` | resize the overlay (live + persisted) |
+| `p:pos center` | reposition the overlay (live + persisted) |
 
 Anything not starting with `p:` goes to Claude untouched. Mid-turn
 commands hit the board within ~100 ms — no waiting for Claude to
@@ -62,6 +64,16 @@ done" and you keep solving at your own pace.
   the pty device; there is no Windows support.
 
 ## Customizing size & position
+
+The quick way — just type it as a prompt, live overlay updates
+instantly and the change persists:
+
+```
+p:size xl        # small | medium | large | xl | xxl | any number (p:size 1.7)
+p:pos center     # top-right | top-left | bottom-right | bottom-left | center | row col (p:pos 3 80)
+```
+
+Or edit the settings file by hand:
 
 ```bash
 uvx --from hook-my-lichess hml-overlay init-config

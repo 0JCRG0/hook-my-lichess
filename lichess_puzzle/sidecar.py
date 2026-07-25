@@ -40,7 +40,7 @@ from pathlib import Path
 
 from . import api, board as board_mod, overlay
 from .engine import PuzzleSession, MoveResult
-from .settings import Settings, load_settings
+from .settings import SIZE_PRESETS, Settings, load_settings
 
 
 IMAGE_ID = 1729
@@ -218,7 +218,7 @@ class Daemon:
         self.claude_idle: bool = False
         self.closing_at: float | None = None
         self._closing_total: float = 3.0
-        self._giveup_closing_total: float = 5.0
+        self._giveup_closing_total: float = 10.0
         self.should_exit: bool = False
         self._fetch_q: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
@@ -314,7 +314,8 @@ class Daemon:
         if msg.startswith("MOVE "):
             text = msg[5:]
             if self._dedup_dispatch(text):
-                self._submit_text(text)
+                if not self._handle_config(text):
+                    self._submit_text(text)
             return
 
     # ── puzzle lifecycle ──────────────────────────────────────────────
@@ -401,6 +402,74 @@ class Daemon:
             self._update_overlay()
         else:
             self._update_overlay()
+
+    def _handle_config(self, text: str) -> bool:
+        """`p:size <preset|number>` / `p:pos <preset|row col>` — live
+        config commands. Applied to the running overlay immediately and
+        persisted to the user settings file for future daemons. Returns
+        False if `text` isn't a config command (it's then a move)."""
+        parts = text.split()
+        if len(parts) < 2:
+            return False
+        cmd = parts[0].lower()
+        if cmd == "size":
+            raw_str = parts[1].lower()
+            raw: object = raw_str
+            if raw_str not in SIZE_PRESETS:
+                try:
+                    raw = float(raw_str)
+                except ValueError:
+                    self.status_msg = (
+                        f"✗ size: '{parts[1]}' — use "
+                        f"{'/'.join(SIZE_PRESETS)} or a number"
+                    )
+                    self._update_overlay()
+                    return True
+            key = "size"
+        elif cmd in ("pos", "position"):
+            args = [a.strip(",") for a in parts[1:] if a.strip(",")]
+            if len(args) == 2 and all(a.lstrip("-").isdigit() for a in args):
+                raw = [int(args[0]), int(args[1])]
+            else:
+                raw = args[0].lower()
+            key = "position"
+        else:
+            return False
+
+        try:
+            merged = self.settings.model_dump()
+            merged[key] = raw
+            self.settings = Settings.model_validate(merged)
+        except Exception:
+            self.status_msg = f"✗ {key}: invalid value '{' '.join(parts[1:])}'"
+            self._update_overlay()
+            return True
+        self.spec = self._build_spec()
+        self._persist_config(key, raw)
+        shown = " ".join(str(x) for x in raw) if isinstance(raw, list) else raw
+        self.status_msg = f"✓ {key} → {shown}"
+        self._update_overlay()
+        return True
+
+    def _persist_config(self, key: str, raw: object) -> None:
+        """Merge one key into ~/.config/hml/settings.json (keeping any
+        other keys the user has set there)."""
+        import json
+
+        path = Path.home() / ".config" / "hml" / "settings.json"
+        data: dict = {}
+        try:
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            pass
+        data[key] = raw
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2) + "\n")
+        except OSError as e:
+            _dbg(f"_persist_config: {e!r}")
 
     def _show_move_result(self, r: MoveResult) -> None:
         if r.kind == "ok":

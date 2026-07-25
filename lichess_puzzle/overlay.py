@@ -386,6 +386,8 @@ def _draw_legend(
         ("p:hint", "hint"),
         ("p:solve", "reveal"),
         ("p:quit", "close"),
+        ("p:size xl", "resize"),
+        ("p:pos center", "move box"),
     ]
     x = spec.label_gutter + spec.board_px + 2 * spec.padding
     y = spec.header_h + spec.padding
