@@ -52,7 +52,7 @@ export LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxx   # add to your shell rc
 
 ```
 /plugin marketplace add 0JCRG0/hook-my-lichess
-/plugin install hook-my-lichess@hml
+/plugin install hook-my-lichess@jcrg-tooling
 ```
 
 That's it. The next prompt you submit will fire the hooks; `uvx`

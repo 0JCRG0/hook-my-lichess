@@ -1,5 +1,5 @@
 {
-  "name": "hml",
+  "name": "jcrg-tooling",
   "owner": {
     "name": "0JCRG0",
     "url": "https://github.com/0JCRG0"
@@ -9,7 +9,7 @@
       "name": "hook-my-lichess",
       "source": ".",
       "description": "Lichess puzzle overlay that appears in your terminal while Claude is working.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "0JCRG0"
       },
