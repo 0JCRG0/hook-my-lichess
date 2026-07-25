@@ -373,7 +373,10 @@ class Daemon:
             self._update_celebration_banner()
             self._update_overlay()
             return
-        self.status_msg = ""
+        # Keep status_msg: it holds the latest move feedback (✓/✗), and a
+        # p:<move> submitted while idle triggers a Stop right after the
+        # move dispatch — clearing here would erase the feedback the user
+        # is looking for.
         self.banner = "✓ Claude is done — finish at your leisure."
         self._update_overlay()
 
