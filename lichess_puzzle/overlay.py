@@ -489,20 +489,25 @@ def _wrap_text(
 # ── Kitty graphics protocol ───────────────────────────────────────────────
 
 
-CHUNK = 4096
+# Base64 payload per APC escape. Kept small (~512B per write) because
+# the daemon shares the pty with Claude Code: each escape must fit in a
+# single kernel write that can't block halfway, otherwise Claude's
+# concurrent output interleaves *inside* the escape, the terminal's
+# parser aborts, and the rest of the base64 body prints as raw text.
+CHUNK = 512
 
 
 def _kitty(payload: str) -> bytes:
     return f"\x1b_G{payload}\x1b\\".encode()
 
 
-def kitty_transmit(
+def kitty_transmit_chunks(
     png: bytes,
     image_id: int,
     cells_w: int | None = None,
     cells_h: int | None = None,
     placement_id: int = 1,
-) -> bytes:
+) -> list[bytes]:
     """Transmit + display an image at a stable placement id.
 
     `p={placement_id}` pins the placement so subsequent transmits
@@ -521,14 +526,28 @@ def kitty_transmit(
         extras += f",r={cells_h}"
     b64 = base64.b64encode(png).decode("ascii")
     if len(b64) <= CHUNK:
-        return _kitty(f"a=T,f=100,i={image_id},q=2{extras};{b64}")
+        return [_kitty(f"a=T,f=100,i={image_id},q=2{extras};{b64}")]
     parts = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
-    out = bytearray()
-    out += _kitty(f"a=T,f=100,i={image_id},q=2{extras},m=1;{parts[0]}")
+    chunks = [_kitty(f"a=T,f=100,i={image_id},q=2{extras},m=1;{parts[0]}")]
     for p in parts[1:-1]:
-        out += _kitty(f"m=1;{p}")
-    out += _kitty(f"m=0;{parts[-1]}")
-    return bytes(out)
+        chunks.append(_kitty(f"m=1;{p}"))
+    chunks.append(_kitty(f"m=0;{parts[-1]}"))
+    return chunks
+
+
+def kitty_transmit(
+    png: bytes,
+    image_id: int,
+    cells_w: int | None = None,
+    cells_h: int | None = None,
+    placement_id: int = 1,
+) -> bytes:
+    """Whole transmission as one buffer — only safe when nothing else
+    writes to the same tty (standalone CLI). The daemon must use
+    kitty_transmit_chunks and write escape-by-escape instead."""
+    return b"".join(
+        kitty_transmit_chunks(png, image_id, cells_w, cells_h, placement_id)
+    )
 
 
 def kitty_place(image_id: int, placement_id: int = 1) -> bytes:

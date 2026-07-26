@@ -371,6 +371,9 @@ class Daemon:
 
     def _on_idle(self) -> None:
         self.claude_idle = True
+        # Claude Code repaints heavily right as the turn ends; give it a
+        # beat before re-transmitting so the writes don't interleave.
+        time.sleep(0.25)
         if self.closing_at is not None:
             self._update_celebration_banner()
             self._update_overlay()
@@ -527,12 +530,16 @@ class Daemon:
         png = overlay.render_png(self.session, self.status_msg, self.banner, self.spec)
         cells_w, cells_h = self.spec.cell_size()
         anchor_row, anchor_col = self.layout.overlay_anchor(self.spec, self.settings.position)
-        out = bytearray()
-        out += _cursor_save()
-        out += _goto(anchor_row, anchor_col)
-        out += overlay.kitty_transmit(png, IMAGE_ID, cells_w=cells_w, cells_h=cells_h)
-        out += _cursor_restore()
-        self._write_tty(bytes(out))
+        # One os.write per complete escape. A single ~100 KB write blocks
+        # mid-escape on the pty buffer, and Claude's concurrent output
+        # then interleaves inside the escape — the terminal aborts the
+        # APC and prints the remaining base64 as raw text.
+        self._write_tty(_cursor_save() + _goto(anchor_row, anchor_col))
+        for chunk in overlay.kitty_transmit_chunks(
+            png, IMAGE_ID, cells_w=cells_w, cells_h=cells_h
+        ):
+            self._write_tty(chunk)
+        self._write_tty(_cursor_restore())
         self.image_transmitted = True
 
     def _place_overlay(self) -> None:
